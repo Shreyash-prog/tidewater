@@ -216,3 +216,43 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# === Tidewater additions ===
+
+# Local environment
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# AWS / CDK
+cdk.out/
+.cdk.staging/
+.cdk.context.json
+
+# Dashboard build artifacts
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.vite/
+dashboard/src/api/generated/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Test / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Mise/local tool config that shouldn't be shared
+.tool-versions.local
+
+# Secrets — extra layer of protection
+*.pem
+*.key
+secrets/
