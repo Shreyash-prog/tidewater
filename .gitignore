@@ -256,3 +256,6 @@ coverage.xml
 *.pem
 *.key
 secrets/
+
+# macOS
+.DS_Store
