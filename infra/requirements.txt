@@ -1,0 +1,3 @@
+# CDK app dependencies. Pinned; see requirements-dev.txt for the rationale.
+aws-cdk-lib==2.257.0
+constructs==10.6.0
