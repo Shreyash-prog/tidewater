@@ -1,0 +1,14 @@
+# Tidewater — developer toolchain (lint, type-check, test).
+#
+# Installed into the local/CI virtualenv by `make install`. These tools are NOT
+# bundled into Lambda deployment packages — runtime deps live in each Lambda's
+# own requirements.txt (e.g. lambdas/shared/requirements.txt).
+#
+# Versions are pinned (resolved once with `pip install --upgrade-strategy=eager`)
+# so local and CI environments match exactly.
+
+ruff==0.15.15
+mypy==2.1.0
+pytest==9.0.3
+moto==5.2.1
+boto3-stubs[iam,lambda,dynamodb,s3,events,sns,ssm,scheduler,cognito-idp,apigatewayv2]==1.43.18
