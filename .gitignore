@@ -237,6 +237,11 @@ dashboard/dist/
 dashboard/.vite/
 dashboard/src/api/generated/
 
+# The generic, unanchored Python `lib/` rule above would otherwise swallow the
+# dashboard's source lib dir (e.g. dashboard/src/lib/utils.ts) — keep it tracked.
+!dashboard/src/lib/
+!dashboard/src/lib/**
+
 # IDE
 .vscode/settings.json
 .idea/
