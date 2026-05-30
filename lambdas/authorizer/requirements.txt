@@ -1,0 +1,3 @@
+# Runtime deps for the authorizer Lambda.
+# Empty: Powertools comes from a layer, boto3 from the runtime. Pin with ==
+# versions here if this Lambda gains dependencies (Phase 8).

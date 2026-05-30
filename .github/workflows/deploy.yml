@@ -1,0 +1,40 @@
+name: Deploy CoreStack
+
+# Manual trigger only. Authenticates to AWS via GitHub OIDC (no long-lived keys)
+# by assuming the deploy role created by OidcStack. Set the role ARN as the
+# AWS_DEPLOY_ROLE_ARN repository variable first (see README).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # required to request the OIDC token
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  JSII_SILENCE_WARNING_DEPRECATED_NODE_VERSION: "1"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install CDK CLI and infra deps
+        run: |
+          npm install -g aws-cdk@2
+          python -m pip install --upgrade pip
+          pip install -r infra/requirements.txt
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy CoreStack
+        run: cdk deploy PlatformHygiene-Core --require-approval never
