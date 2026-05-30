@@ -32,6 +32,40 @@ openapi/    Hand-edited API spec, generated TS client
 docs/       Scope, architecture, build plan, demo script
 ```
 
+## Quick start (local development)
+
+Prerequisites: **Python 3.12**, **Node 20**, and the **AWS CDK CLI** (`npm i -g aws-cdk`)
+on your `PATH`. No AWS account or credentials are needed for Phase 1 — nothing
+deploys yet.
+
+```bash
+make install   # create .venv, install Python + dashboard deps
+make lint      # Ruff check + format check (Python), Prettier check (dashboard)
+make test      # pytest + dashboard typecheck
+make synth     # cdk synth — sanity-check the (empty) CDK app
+```
+
+`make help` lists every target. `make deploy`, `make destroy`, and
+`make seed-history` are intentional no-ops until later phases wire them up.
+
+### Repo conventions
+
+- **Branches & commits:** feature branch per phase, [Conventional Commits](https://www.conventionalcommits.org/),
+  PRs into `main`.
+- **Pre-commit:** run `make install` once, then commits automatically run
+  gitleaks (secret scan) plus Ruff, mypy, and Prettier. The repo uses
+  `core.hooksPath=.githooks`; the gitleaks hook delegates to `pre-commit run`,
+  so there's no separate `pre-commit install` step. Do not bypass these hooks.
+- **Toolchain:** Ruff (lint + format), mypy (`disallow_untyped_defs`), pytest,
+  CDK in Python. Config lives in `pyproject.toml` (Python) and `dashboard/`
+  (TypeScript). Dependency versions are pinned.
+
+### Layout notes
+
+- Python import roots are `lambdas/` and `infra/` (e.g. `from shared.models import …`).
+- Per-Lambda runtime deps live in each Lambda's `requirements.txt`; the dev
+  toolchain lives in `requirements-dev.txt`.
+
 ## Documentation
 
 See `docs/`:
