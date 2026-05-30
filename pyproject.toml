@@ -1,0 +1,33 @@
+# Shared tooling configuration for the Tidewater backend (lambdas/ + infra/).
+# Per-Lambda runtime dependencies live in each Lambda's requirements.txt; this
+# file only configures the dev toolchain (Ruff, mypy, pytest).
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["lambdas", "infra", "tests"]
+
+[tool.ruff.lint]
+# E/F: pyflakes + pycodestyle, I: import sorting, B: bugbear, UP: pyupgrade,
+# SIM: simplify, ANN: enforce type annotations (mirrors mypy disallow_untyped_defs).
+select = ["E", "F", "I", "B", "UP", "SIM", "ANN"]
+# ANN401 (no `Any`) is impractical for CDK construct **kwargs; allow it.
+ignore = ["ANN401"]
+
+[tool.mypy]
+python_version = "3.12"
+disallow_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# lambdas/ and infra/ are import roots (e.g. `from shared.models import ...`,
+# `from stacks.core_stack import ...`), not installed packages.
+mypy_path = ["lambdas", "infra"]
+explicit_package_bases = true
+namespace_packages = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+# Test sources are importable from the same roots used at runtime.
+pythonpath = ["lambdas", "infra", "."]
+testpaths = ["tests", "lambdas/tests", "infra/tests"]
+addopts = "-q"

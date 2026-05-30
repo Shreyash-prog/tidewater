@@ -1,0 +1,5 @@
+# Runtime dependencies shared by every Lambda. This file is packaged into each
+# Lambda deployment bundle. boto3 is intentionally omitted — the Lambda runtime
+# provides it (and moto pulls it into the local/CI venv for tests).
+pydantic==2.13.4
+aws-lambda-powertools==3.29.0

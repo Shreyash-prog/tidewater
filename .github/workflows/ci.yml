@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Python toolchain
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt -r infra/requirements.txt -r lambdas/shared/requirements.txt
+      - name: Ruff check
+        run: ruff check lambdas infra tests
+      - name: Ruff format check
+        run: ruff format --check lambdas infra tests
+
+  typecheck:
+    name: typecheck (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Python toolchain
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt -r infra/requirements.txt -r lambdas/shared/requirements.txt
+      - name: mypy
+        run: mypy lambdas infra
+
+  pytest:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Python toolchain
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt -r infra/requirements.txt -r lambdas/shared/requirements.txt
+      - name: pytest
+        run: pytest
+
+  cdk-synth:
+    name: cdk-synth
+    runs-on: ubuntu-latest
+    env:
+      JSII_SILENCE_WARNING_DEPRECATED_NODE_VERSION: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk@2
+      - name: Install infra deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r infra/requirements.txt
+      - name: cdk synth
+        working-directory: infra
+        run: cdk synth --quiet
+
+  dashboard-build:
+    name: dashboard-build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: Install deps
+        run: npm ci
+      - name: Prettier check
+        run: npm run format:check
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build

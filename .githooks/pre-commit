@@ -1,2 +1,13 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
+# Secret scanning — do not bypass (see CLAUDE.md).
 gitleaks protect --staged --redact --no-banner
+
+# Lint / format / type hooks (Ruff, mypy, prettier) via the pre-commit framework.
+# This repo sets core.hooksPath=.githooks, so `pre-commit install` is a no-op;
+# we delegate explicitly here. Skipped gracefully if pre-commit isn't installed
+# yet (run `make install` to set up the toolchain).
+if command -v pre-commit >/dev/null 2>&1; then
+  pre-commit run --config .pre-commit-config.yaml --hook-stage pre-commit
+fi

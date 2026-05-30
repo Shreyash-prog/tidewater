@@ -1,0 +1,40 @@
+# Local pre-commit hooks: Ruff (lint + format), mypy, and prettier.
+#
+# These run the project's own pinned tools (the .venv created by `make install`
+# and the dashboard's node_modules) rather than pre-commit-managed clones, so
+# hook versions always match CI exactly and no network is needed at commit time.
+#
+# Secret scanning (gitleaks) is handled separately by .githooks/pre-commit,
+# which also invokes `pre-commit run` so these hooks fire on commit. The repo
+# sets core.hooksPath=.githooks, so `pre-commit install` is intentionally not
+# used. Run `make install` once before committing.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: .venv/bin/ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ruff-format
+        name: ruff format
+        entry: .venv/bin/ruff format
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: mypy
+        name: mypy
+        entry: .venv/bin/mypy lambdas infra
+        language: system
+        files: ^(lambdas|infra)/.*\.py$
+        pass_filenames: false
+
+      - id: prettier
+        name: prettier (dashboard)
+        entry: dashboard/node_modules/.bin/prettier --write --ignore-unknown
+        language: system
+        files: ^dashboard/.*\.(ts|tsx|css|json|html)$
+        exclude: ^dashboard/(package-lock\.json|node_modules/|dist/)
