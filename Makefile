@@ -67,12 +67,16 @@ synth: ## cdk synth (sanity-check IaC); requires the cdk CLI on PATH
 	PATH="$(CURDIR)/$(VENV)/bin:$$PATH" cdk synth --quiet
 
 .PHONY: deploy
-deploy: ## (Phase 2+) cdk deploy --all
-	@echo "deploy is not wired up until Phase 2 (CoreStack). No-op."
+deploy: ## Deploy CoreStack (assumes OidcStack already bootstrapped — see README)
+	PATH="$(CURDIR)/$(VENV)/bin:$$PATH" cdk deploy PlatformHygiene-Core --require-approval never
+
+.PHONY: deploy-oidc
+deploy-oidc: ## One-time: deploy the OIDC provider + deploy role (run from a laptop)
+	PATH="$(CURDIR)/$(VENV)/bin:$$PATH" cdk deploy PlatformHygiene-Oidc --require-approval never
 
 .PHONY: destroy
-destroy: ## (Phase 2+) cdk destroy --all
-	@echo "destroy is not wired up until Phase 2 (CoreStack). No-op."
+destroy: ## cdk destroy --all (RETAIN buckets — audit-log, snapshots — persist)
+	PATH="$(CURDIR)/$(VENV)/bin:$$PATH" cdk destroy --all
 
 .PHONY: seed-history
 seed-history: ## (Phase 11) invoke the bootstrap_history Lambda
