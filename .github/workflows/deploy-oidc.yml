@@ -1,0 +1,52 @@
+name: Deploy OidcStack
+
+# OidcStack bootstraps the GitHub OIDC provider and the deploy role itself.
+#
+# CHICKEN-AND-EGG: the very FIRST deploy must run from a developer laptop, because
+# the role this workflow would assume does not exist until OidcStack is deployed.
+# See the README ("Deploying for the first time").
+#
+# Once OidcStack exists and AWS_DEPLOY_ROLE_ARN is set, this workflow can deploy
+# *updates* to OidcStack via OIDC (the role can manage its own stack).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  JSII_SILENCE_WARNING_DEPRECATED_NODE_VERSION: "1"
+
+jobs:
+  deploy-oidc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard against un-bootstrapped first run
+        if: ${{ vars.AWS_DEPLOY_ROLE_ARN == '' }}
+        run: |
+          echo "::error::AWS_DEPLOY_ROLE_ARN is not set. OidcStack must be deployed"
+          echo "::error::once from a laptop first (cdk deploy PlatformHygiene-Oidc),"
+          echo "::error::then set the AWS_DEPLOY_ROLE_ARN repo variable. See README."
+          exit 1
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install CDK CLI and infra deps
+        run: |
+          npm install -g aws-cdk@2
+          python -m pip install --upgrade pip
+          pip install -r infra/requirements.txt
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy OidcStack
+        run: cdk deploy PlatformHygiene-Oidc --require-approval never
