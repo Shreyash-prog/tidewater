@@ -64,7 +64,7 @@ test: ## Run pytest (all suites) and the dashboard typecheck
 
 .PHONY: synth
 synth: ## cdk synth (sanity-check IaC); requires the cdk CLI on PATH
-	cd infra && PATH="$(CURDIR)/$(VENV)/bin:$$PATH" cdk synth --quiet
+	PATH="$(CURDIR)/$(VENV)/bin:$$PATH" cdk synth --quiet
 
 .PHONY: deploy
 deploy: ## (Phase 2+) cdk deploy --all
