@@ -1,0 +1,4 @@
+# Runtime deps for the api Lambda.
+# Intentionally empty: AWS Lambda Powertools is supplied by a managed layer and
+# boto3 by the Lambda runtime, so nothing is pip-installed into the bundle.
+# When this Lambda gains deps (Phase 8), pin them here with == versions.

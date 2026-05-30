@@ -1,0 +1,2 @@
+# Runtime deps for the bearer-token custom resource Lambda.
+# Empty: secrets is stdlib, boto3 is provided by the Lambda runtime.
