@@ -66,6 +66,12 @@ test: ## Run pytest (all suites) and the dashboard typecheck
 synth: ## cdk synth (sanity-check IaC); requires the cdk CLI on PATH
 	PATH="$(CURDIR)/$(VENV)/bin:$$PATH" cdk synth --quiet
 
+.PHONY: refresh-powertools
+refresh-powertools: ## Re-resolve the Powertools layer version into cdk.context.json (needs AWS creds)
+	rm -f cdk.context.json
+	PATH="$(CURDIR)/$(VENV)/bin:$$PATH" cdk synth > /dev/null
+	@echo "Powertools layer version refreshed in cdk.context.json — commit the change."
+
 .PHONY: deploy
 deploy: ## Deploy CoreStack (assumes OidcStack already bootstrapped — see README)
 	PATH="$(CURDIR)/$(VENV)/bin:$$PATH" cdk deploy PlatformHygiene-Core --require-approval never

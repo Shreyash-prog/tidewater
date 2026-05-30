@@ -25,21 +25,17 @@ import jsii
 from aws_cdk import BundlingOptions, DockerImage, Duration, ILocalBundling, RemovalPolicy
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
+from aws_cdk import aws_ssm as ssm
 from constructs import Construct
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# AWS-managed Powertools for Python (v3) layer, us-east-1, arm64, Python 3.12.
-# The account (017000801446) is AWS's public layer account.
-# NOTE: bump this version to the latest before the first deploy — AWS publishes
-# new layer versions regularly and old ones are eventually deprecated. Verify with:
-#   aws lambda list-layer-versions --layer-name AWSLambdaPowertoolsPythonV3-python312-arm64 \
-#     --region us-east-1 --query 'LayerVersions[0].Version'
-POWERTOOLS_LAYER_VERSION = 24
-POWERTOOLS_LAYER_ARN = (
-    "arn:aws:lambda:us-east-1:017000801446:layer:"
-    f"AWSLambdaPowertoolsPythonV3-python312-arm64:{POWERTOOLS_LAYER_VERSION}"
-)
+# AWS publishes the latest Powertools (Python v3) layer ARN as a public SSM
+# parameter. Reading it with value_from_lookup resolves the current version at
+# synth time and caches it in cdk.context.json, so the resolved ARN is baked into
+# the template (visible in `cdk diff`) rather than hardcoded. Refresh with
+# `make refresh-powertools`.
+POWERTOOLS_PARAM = "/aws/service/powertools/python/arm64/python3.12/latest"
 
 # Image used only when a Lambda actually has dependencies to pip-install.
 _BUNDLING_IMAGE = "public.ecr.aws/sam/build-python3.12:latest-arm64"
@@ -136,8 +132,11 @@ class PythonLambda(Construct):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
+        powertools_layer_arn = ssm.StringParameter.value_from_lookup(
+            self, parameter_name=POWERTOOLS_PARAM
+        )
         powertools_layer = lambda_.LayerVersion.from_layer_version_arn(
-            self, "PowertoolsLayer", POWERTOOLS_LAYER_ARN
+            self, "PowertoolsLayer", powertools_layer_arn
         )
 
         env = {

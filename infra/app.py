@@ -9,16 +9,26 @@ Three stacks:
   * FixturesStack — demo-only resources; empty until Phase 7.
 """
 
+import os
+
 import aws_cdk as cdk
 
 from infra.stacks.core_stack import CoreStack
 from infra.stacks.fixtures_stack import FixturesStack
 from infra.stacks.oidc_stack import OidcStack
 
-# us-east-1 only (docs/architecture.md §1). Account is resolved from the
-# deploying environment at synth/deploy time; left unset so `cdk synth` works
-# without credentials in CI.
-ENV = cdk.Environment(region="us-east-1")
+# Single-account POC, us-east-1 only (docs/scope-poc.md §2, architecture.md §1).
+# A concrete account is required because CoreStack reads the Powertools layer ARN
+# via an SSM context lookup, which can't run against an environment-agnostic
+# stack. The resolved value is cached in the committed cdk.context.json, so CI
+# (no credentials) synthesizes from cache without hitting AWS. Override the
+# account with CDK_DEFAULT_ACCOUNT for a different account (regenerate the cache
+# with `make refresh-powertools`).
+POC_ACCOUNT = "155936382216"
+ENV = cdk.Environment(
+    account=os.environ.get("CDK_DEFAULT_ACCOUNT", POC_ACCOUNT),
+    region="us-east-1",
+)
 
 # Applied to every resource in every stack (build-plan Phase 2 safety rules).
 TAGS = {"Project": "Tidewater", "Environment": "POC"}

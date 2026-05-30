@@ -106,6 +106,23 @@ The `audit-log` and `snapshots` buckets have a **RETAIN** removal policy and
 **survive teardown** (they hold the audit trail and pre-deletion snapshots);
 delete them by hand if you really want them gone. Everything else is removed.
 
+## Maintenance
+
+### Powertools layer version
+
+The AWS Lambda Powertools layer ARN is resolved at synth time from the public SSM
+parameter `/aws/service/powertools/python/arm64/python3.12/latest` (via CDK
+`value_from_lookup`) and cached in the committed `cdk.context.json`. CI synth
+reads the cached value, so it needs no AWS credentials. To pick up a newer
+Powertools release:
+
+```bash
+make refresh-powertools   # needs AWS creds; rewrites cdk.context.json
+```
+
+Commit the updated `cdk.context.json`. `cdk diff` will then show the layer
+version change clearly.
+
 ### Repo conventions
 
 - **Branches & commits:** feature branch per phase, [Conventional Commits](https://www.conventionalcommits.org/),
