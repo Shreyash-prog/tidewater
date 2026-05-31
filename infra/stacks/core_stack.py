@@ -52,9 +52,6 @@ RETAIN_BUCKETS = {"audit-log", "snapshots"}
 BEARER_TOKEN_PARAM = "/platform-hygiene/poc/bearer-token"
 DEPLOY_VERSION_PARAM = "/platform-hygiene/poc/deploy-version"
 
-# Account-creation email; the +tidewater alias routes budget alerts.
-BUDGET_EMAIL = "shreyashkalalus+tidewater@gmail.com"
-
 BUDGET_NAME = "tidewater-poc-budget"
 BUDGET_LIMIT_USD = 20
 
@@ -76,8 +73,18 @@ PLACEHOLDER_HTML = """<!doctype html>
 
 
 class CoreStack(Stack):
-    def __init__(self, scope: Construct, construct_id: str, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        notification_email: str,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(scope, construct_id, **kwargs)
+        # Where budget alerts and SNS notifications are sent (configurable via the
+        # `notification_email` CDK context value — see infra/app.py).
+        self._notification_email = notification_email
 
         deploy_version = CfnParameter(
             self,
@@ -287,7 +294,7 @@ class CoreStack(Stack):
     def _sns_topics(self) -> tuple[sns.Topic, sns.Topic]:
         notifications = sns.Topic(self, "NotificationsTopic", topic_name="tidewater-notifications")
         budget_alerts = sns.Topic(self, "BudgetAlertsTopic", topic_name="tidewater-budget-alerts")
-        budget_alerts.add_subscription(subscriptions.EmailSubscription(BUDGET_EMAIL))
+        budget_alerts.add_subscription(subscriptions.EmailSubscription(self._notification_email))
         # Allow AWS Budgets to publish budget alerts to the topic.
         budget_alerts.add_to_resource_policy(
             iam.PolicyStatement(
@@ -460,7 +467,7 @@ class CoreStack(Stack):
         def subscribers() -> list[budgets.CfnBudget.SubscriberProperty]:
             return [
                 budgets.CfnBudget.SubscriberProperty(
-                    subscription_type="EMAIL", address=BUDGET_EMAIL
+                    subscription_type="EMAIL", address=self._notification_email
                 ),
                 budgets.CfnBudget.SubscriberProperty(
                     subscription_type="SNS", address=budget_topic.topic_arn
@@ -508,7 +515,9 @@ class CoreStack(Stack):
                 )
             ),
             subscribers=[
-                budgets.CfnBudgetsAction.SubscriberProperty(type="EMAIL", address=BUDGET_EMAIL)
+                budgets.CfnBudgetsAction.SubscriberProperty(
+                    type="EMAIL", address=self._notification_email
+                )
             ],
         )
         action.add_dependency(budget)
