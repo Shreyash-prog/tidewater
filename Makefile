@@ -58,9 +58,13 @@ typecheck: ## mypy over lambdas + infra
 	$(MYPY) lambdas infra
 
 .PHONY: test
-test: ## Run pytest (all suites) and the dashboard typecheck
+test: ## Run pytest (all suites except smoke) and the dashboard typecheck
 	$(PYTEST)
 	cd $(DASHBOARD) && npm run typecheck
+
+.PHONY: smoke
+smoke: ## Run integration smoke tests (needs real AWS creds + deployed stack)
+	$(PYTEST) tests/smoke/ -m smoke -v
 
 .PHONY: synth
 synth: ## cdk synth (sanity-check IaC); requires the cdk CLI on PATH

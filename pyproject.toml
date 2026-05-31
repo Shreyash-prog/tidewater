@@ -36,4 +36,9 @@ plugins = ["pydantic.mypy"]
 # deliberately absent so the `infra` package (not a bare dir) is what's imported.
 pythonpath = ["lambdas", "."]
 testpaths = ["tests", "lambdas/tests", "infra/tests"]
-addopts = "-q"
+# Smoke tests need real AWS credentials and a deployed stack — excluded from the
+# default run; `make smoke` selects them explicitly.
+addopts = "-q -m 'not smoke'"
+markers = [
+    "smoke: integration test requiring real AWS credentials and a deployed stack",
+]
