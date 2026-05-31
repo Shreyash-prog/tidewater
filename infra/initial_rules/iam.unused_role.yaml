@@ -1,0 +1,11 @@
+rule: iam.unused_role
+enabled: true
+schedule: on-demand
+threshold:
+  idle_days: 7
+forecast:
+  enabled: false
+policy:
+  default: dry_run
+notifications:
+  channels: [eventbridge, sns]

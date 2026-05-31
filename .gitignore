@@ -264,3 +264,6 @@ secrets/
 
 # macOS
 .DS_Store
+
+# Lambda staging (host-built asset bundles)
+.lambda-build/
