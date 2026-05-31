@@ -33,12 +33,21 @@ ENV = cdk.Environment(
 # Applied to every resource in every stack (build-plan Phase 2 safety rules).
 TAGS = {"Project": "Tidewater", "Environment": "POC"}
 
+# Where budget alerts and SNS notifications are sent. Defaults to the email that
+# owns the AWS account; override via `cdk ... -c notification_email=...` or the
+# committed cdk.context.json.
+DEFAULT_NOTIFICATION_EMAIL = "shreyashkalalwork@gmail.com"
+
 
 def main() -> None:
     app = cdk.App()
 
+    notification_email = app.node.try_get_context("notification_email") or (
+        DEFAULT_NOTIFICATION_EMAIL
+    )
+
     OidcStack(app, "PlatformHygiene-Oidc", env=ENV)
-    CoreStack(app, "PlatformHygiene-Core", env=ENV)
+    CoreStack(app, "PlatformHygiene-Core", env=ENV, notification_email=notification_email)
     FixturesStack(app, "PlatformHygiene-Fixtures", env=ENV)  # no direct dep; SSM lookup later
 
     for key, value in TAGS.items():

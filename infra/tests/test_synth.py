@@ -12,7 +12,7 @@ ENV = cdk.Environment(account="123456789012", region="us-east-1")
 
 def test_stacks_synthesize() -> None:
     app = cdk.App()
-    core = CoreStack(app, "TestCore", env=ENV)
+    core = CoreStack(app, "TestCore", env=ENV, notification_email="test@example.com")
     fixtures = FixturesStack(app, "TestFixtures", env=ENV)
     oidc = OidcStack(app, "TestOidc", env=ENV)
 

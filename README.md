@@ -54,6 +54,11 @@ are live as of Phase 2 — see **Deploying** below.
 Phase 2 creates real AWS resources (all pay-per-use; ~$0/month idle). Region is
 `us-east-1` only. A $20 AWS Budget with a 100% stop-action is the cost backstop.
 
+Budget alerts and SNS notifications are sent to the `notification_email` CDK
+context value (defaults to the AWS account owner, `shreyashkalalwork@gmail.com`,
+and is committed in `cdk.context.json`). Override per deploy with
+`cdk deploy -c notification_email=you@example.com`.
+
 ### Deploying for the first time
 
 1. **Bootstrap CDK** (once per account/region): `cdk bootstrap aws://<account>/us-east-1`

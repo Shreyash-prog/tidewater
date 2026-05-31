@@ -1,3 +1,4 @@
 {
+  "notification_email": "shreyashkalalwork@gmail.com",
   "ssm:account=155936382216:parameterName=/aws/service/powertools/python/arm64/python3.12/latest:region=us-east-1": "arn:aws:lambda:us-east-1:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-arm64:33"
 }
