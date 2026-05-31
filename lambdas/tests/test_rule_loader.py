@@ -118,3 +118,32 @@ def test_results_are_cached() -> None:
     )
     second = rule_loader.load_enabled_rules_for_service("iam")
     assert [r.rule_id for r in second] == [r.rule_id for r in first]
+
+
+CUSTOM_PREFIX_RULE = """\
+rule: iam.unused_role
+enabled: true
+threshold:
+  idle_days: 0
+policy:
+  default: dry_run
+"""
+
+
+@mock_aws
+def test_loads_rules_from_custom_prefix() -> None:
+    # A custom prefix (e.g. the smoke test's scoped key) is read instead of "rules/".
+    _seed_bucket(
+        {
+            "rules/iam.unused_role.yaml": VALID_RULE,
+            "rules-smoketest/abc/iam.unused_role.yaml": CUSTOM_PREFIX_RULE,
+        }
+    )
+
+    custom = rule_loader.load_enabled_rules_for_service("iam", prefix="rules-smoketest/abc/")
+    assert len(custom) == 1
+    assert custom[0].threshold == {"idle_days": 0}
+
+    # The default prefix is cached separately and still returns the production rule.
+    default = rule_loader.load_enabled_rules_for_service("iam")
+    assert default[0].threshold == {"idle_days": 7}

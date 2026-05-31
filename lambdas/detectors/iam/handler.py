@@ -48,18 +48,17 @@ def _resolve_account(event: dict[str, Any]) -> str:
 def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, int]:
     account = _resolve_account(event)
     region = event.get("region") or os.environ.get("AWS_REGION", "us-east-1")
+    # Optional scoped, read-only rule prefix (defaults to production "rules/").
+    # Used by the smoke test and forward-compatible with per-tenant rule sets.
+    rules_prefix = event.get("rules_prefix_override") or "rules/"
 
     try:
-        rules = load_enabled_rules_for_service(SERVICE)
+        rules = load_enabled_rules_for_service(SERVICE, prefix=rules_prefix)
     except Exception:
         # Fail closed: never act on stale/unloadable config.
         logger.exception("failed to load rules; emitting zero findings")
         metrics.add_metric(name="RuleLoadFailure", unit=MetricUnit.Count, value=1)
         return {"findings_emitted": 0, "rules_run": 0}
-
-    # Optional per-invocation threshold override (used by the smoke test to flag a
-    # freshly created role; not used by scheduled runs). e.g. {"idle_days": -1}.
-    threshold_override: dict[str, Any] = event.get("threshold_override") or {}
 
     findings: list[Finding] = []
     rules_run = 0
@@ -69,8 +68,7 @@ def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, int]:
             logger.info("unknown rule_id, skipping", extra={"rule_id": rule.rule_id})
             continue
         rules_run += 1
-        threshold = {**rule.threshold, **threshold_override}
-        detector = detector_cls(account=account, region=region, threshold=threshold)
+        detector = detector_cls(account=account, region=region, threshold=rule.threshold)
         for finding in detector.run():
             finding.policy_decision = PolicyAction.DRY_RUN  # Phase 4 will decide for real
             findings.append(finding)

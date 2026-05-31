@@ -23,7 +23,7 @@ from shared.models import Rule
 logger = Logger(child=True)
 
 CACHE_TTL_SECONDS = 300
-_RULES_PREFIX = "rules/"
+DEFAULT_PREFIX = "rules/"
 
 # S3 transient errors worth retrying.
 _S3_RETRYABLE = frozenset(
@@ -37,7 +37,7 @@ class _CacheEntry:
     rules: list[Rule]
 
 
-_cache: dict[str, _CacheEntry] = {}
+_cache: dict[tuple[str, str], _CacheEntry] = {}
 
 
 def clear_cache() -> None:
@@ -68,18 +68,18 @@ def _to_rule(raw: dict[str, Any]) -> Rule:
     return Rule.model_validate(data)
 
 
-def _list_rule_keys(bucket: str, service: str) -> list[str]:
+def _list_rule_keys(bucket: str, service: str, prefix: str) -> list[str]:
     client = _s3()
     keys: list[str] = []
     token: str | None = None
     while True:
-        kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": _RULES_PREFIX}
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
         if token:
             kwargs["ContinuationToken"] = token
         resp = with_backoff(partial(client.list_objects_v2, **kwargs), retryable=_S3_RETRYABLE)
         for obj in resp.get("Contents", []):
             key = obj["Key"]
-            stem = key[len(_RULES_PREFIX) :].removesuffix(".yaml")
+            stem = key[len(prefix) :].removesuffix(".yaml")
             if key.endswith(".yaml") and stem.startswith(f"{service}."):
                 keys.append(key)
         if not resp.get("IsTruncated"):
@@ -108,19 +108,22 @@ def _load_rule(bucket: str, key: str) -> Rule | None:
         return None
 
 
-def load_enabled_rules_for_service(service: str) -> list[Rule]:
+def load_enabled_rules_for_service(service: str, prefix: str = DEFAULT_PREFIX) -> list[Rule]:
     """Return enabled, validated rules for a service.
 
-    Cached for CACHE_TTL_SECONDS. Raises on persistent S3 errors (fail closed).
-    Individual malformed rules are skipped, not fatal.
+    `prefix` is the S3 key prefix to list under (default "rules/"); it's a scoped,
+    read-only knob for tests and future per-tenant rule sets. Cached per
+    (service, prefix) for CACHE_TTL_SECONDS. Raises on persistent S3 errors (fail
+    closed). Individual malformed rules are skipped, not fatal.
     """
-    cached = _cache.get(service)
+    cache_key = (service, prefix)
+    cached = _cache.get(cache_key)
     if cached and cached.expires_at > time.time():
         return cached.rules
 
     bucket = _rules_bucket()
     rules: list[Rule] = []
-    for key in _list_rule_keys(bucket, service):
+    for key in _list_rule_keys(bucket, service, prefix):
         rule = _load_rule(bucket, key)
         if rule is None:
             continue
@@ -129,5 +132,5 @@ def load_enabled_rules_for_service(service: str) -> list[Rule]:
             continue
         rules.append(rule)
 
-    _cache[service] = _CacheEntry(expires_at=time.time() + CACHE_TTL_SECONDS, rules=rules)
+    _cache[cache_key] = _CacheEntry(expires_at=time.time() + CACHE_TTL_SECONDS, rules=rules)
     return rules
