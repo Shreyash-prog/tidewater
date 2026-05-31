@@ -7,6 +7,7 @@ topics, an HTTP API with a single /health route, the bearer-token SSM parameter
 dashboard. Detector/policy/remediator logic comes in later phases.
 """
 
+from pathlib import Path
 from typing import Any, cast
 
 from aws_cdk import (
@@ -31,6 +32,7 @@ from aws_cdk import aws_s3_deployment as s3deploy
 from aws_cdk import aws_scheduler as scheduler
 from aws_cdk import aws_sns as sns
 from aws_cdk import aws_sns_subscriptions as subscriptions
+from aws_cdk import aws_sqs as sqs
 from aws_cdk import aws_ssm as ssm
 from aws_cdk import custom_resources as cr
 from aws_cdk.aws_apigatewayv2 import (
@@ -45,6 +47,9 @@ from aws_cdk.aws_apigatewayv2_integrations import HttpLambdaIntegration
 from constructs import Construct
 
 from infra.constructs.lambda_function import PythonLambda
+
+# Directory of rule YAMLs uploaded to the rules-yaml bucket on every deploy.
+INITIAL_RULES_DIR = Path(__file__).resolve().parents[1] / "initial_rules"
 
 # Buckets whose removal policy is RETAIN (the audit trail must survive teardown).
 RETAIN_BUCKETS = {"audit-log", "snapshots"}
@@ -103,6 +108,12 @@ class CoreStack(Stack):
         self._ssm_parameters(deploy_version)
         self._budgets(budget_topic)
         self._cloudwatch_dashboard()
+        iam_detector_name = self._iam_detector(
+            rules_bucket=buckets["rules-yaml"],
+            findings_table=tables["findings"],
+            rules_meta_table=tables["rules_meta"],
+            bus=bus,
+        )
 
         self._outputs(
             tables=tables,
@@ -112,6 +123,7 @@ class CoreStack(Stack):
             bus=bus,
             notifications_topic=notifications_topic,
             deploy_version=deploy_version,
+            iam_detector_name=iam_detector_name,
         )
 
     # ------------------------------------------------------------------ DynamoDB
@@ -535,6 +547,96 @@ class CoreStack(Stack):
             )
         )
 
+    # ------------------------------------------------------------------ IAM detector
+    def _iam_detector(
+        self,
+        *,
+        rules_bucket: s3.Bucket,
+        findings_table: dynamodb.Table,
+        rules_meta_table: dynamodb.Table,
+        bus: events.EventBus,
+    ) -> str:
+        # Failed (async) invocations land here for inspection (Phase 3 is on-demand).
+        dlq = sqs.Queue(
+            self,
+            "IamDetectorDlq",
+            queue_name="iam-detector-dlq",
+            retention_period=Duration.days(14),
+        )
+
+        detector = PythonLambda(
+            self,
+            "IamDetector",
+            entry="lambdas/detectors/iam",
+            handler="detectors.iam.handler.handler",
+            include_shared=True,
+            memory_size=512,
+            timeout=Duration.minutes(5),
+            dead_letter_queue=dlq,
+            environment={
+                "RULES_BUCKET": rules_bucket.bucket_name,
+                "FINDINGS_TABLE": findings_table.table_name,
+                "EVENT_BUS_NAME": bus.event_bus_name,
+            },
+            description="Detects idle IAM roles (iam.unused_role). On-demand in Phase 3.",
+        )
+        fn = detector.function
+
+        # Read-only IAM access — never anything destructive (that's Phase 4's remediator).
+        fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "iam:ListRoles",
+                    "iam:GetRole",
+                    "iam:GenerateServiceLastAccessedDetails",
+                    "iam:GetServiceLastAccessedDetails",
+                ],
+                resources=["*"],
+            )
+        )
+        rules_bucket.grant_read(fn)
+        findings_table.grant(
+            fn, "dynamodb:BatchWriteItem", "dynamodb:UpdateItem", "dynamodb:GetItem"
+        )
+        bus.grant_put_events_to(fn)
+
+        # Upload the rule YAML(s) to the bucket on every deploy.
+        s3deploy.BucketDeployment(
+            self,
+            "RulesDeployment",
+            sources=[s3deploy.Source.asset(str(INITIAL_RULES_DIR))],
+            destination_bucket=rules_bucket,
+            destination_key_prefix="rules",
+        )
+
+        # Seed the rules_meta row for iam.unused_role at deploy time.
+        seed_fn = PythonLambda(
+            self,
+            "RulesMetaSeed",
+            entry="lambdas/custom_resources/rules_meta_seed",
+            description="Seeds rules_meta rows at deploy time.",
+        )
+        rules_meta_table.grant(seed_fn.function, "dynamodb:PutItem", "dynamodb:DeleteItem")
+        seed_provider = cr.Provider(
+            self, "RulesMetaSeedProvider", on_event_handler=seed_fn.function
+        )
+        CustomResource(
+            self,
+            "IamUnusedRoleRulesMeta",
+            service_token=seed_provider.service_token,
+            resource_type="Custom::RulesMetaSeed",
+            properties={
+                "TableName": rules_meta_table.table_name,
+                "RuleId": "iam.unused_role",
+                "Enabled": "true",
+                "Version": "1",
+                "S3Key": "rules/iam.unused_role.yaml",
+                "Schedule": "on-demand",
+            },
+        )
+
+        return fn.function_name
+
     # ------------------------------------------------------------------ Outputs
     def _outputs(
         self,
@@ -546,8 +648,10 @@ class CoreStack(Stack):
         bus: events.EventBus,
         notifications_topic: sns.Topic,
         deploy_version: CfnParameter,
+        iam_detector_name: str,
     ) -> None:
         outputs: dict[str, str] = {
+            "IamDetectorLambdaName": iam_detector_name,
             "DashboardUrl": f"https://{distribution.distribution_domain_name}",
             "ApiUrl": api_url,
             "FindingsTableName": tables["findings"].table_name,

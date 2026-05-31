@@ -1,0 +1,5 @@
+# Runtime deps bundled into the iam-detector Lambda (ARM64 wheels).
+# Powertools comes from the managed layer and boto3 from the runtime, so only
+# the libraries the shared code needs that aren't otherwise present are listed.
+pydantic==2.13.4
+PyYAML==6.0.3

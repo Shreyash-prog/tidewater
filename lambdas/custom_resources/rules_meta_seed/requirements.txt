@@ -1,0 +1,2 @@
+# Runtime deps for the rules_meta seed custom resource Lambda.
+# Empty: boto3 is provided by the Lambda runtime.

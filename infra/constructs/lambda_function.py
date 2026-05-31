@@ -10,25 +10,30 @@ conventions in one place (docs/architecture.md §13, CLAUDE.md):
   * a dedicated CloudWatch log group with 1-day retention (Free Tier guardrail)
     and DESTROY removal policy
 
-Packaging: if the Lambda's requirements.txt lists real dependencies, they are
-pip-installed into the asset (host-local bundler preferred, Docker as fallback);
-otherwise the source directory is zipped as-is. Phase 2 Lambdas have no
-third-party deps (Powertools = layer, boto3 = runtime), so synth needs no Docker.
+Packaging (no Docker): the asset is staged on the host into `.lambda-build/`.
+Third-party deps in the Lambda's requirements.txt are pip-installed with
+ARM64/Python-3.12 wheels (so a compiled dep like pydantic-core is correct
+regardless of the build host), and `shared/` is copied in when `include_shared`
+is set. Lambdas with no deps and no shared code are zipped directly.
+
+Staging is skipped when the CDK context value `bundle_lambdas` is `false` (unit
+tests set this — they only assert on template structure, not bundled code).
 """
 
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
 
-import jsii
-from aws_cdk import BundlingOptions, DockerImage, Duration, ILocalBundling, RemovalPolicy
+from aws_cdk import Duration, RemovalPolicy
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
+from aws_cdk import aws_sqs as sqs
 from aws_cdk import aws_ssm as ssm
 from constructs import Construct
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+BUILD_ROOT = REPO_ROOT / ".lambda-build"
+SHARED_DIR = REPO_ROOT / "lambdas" / "shared"
 
 # AWS publishes the latest Powertools (Python v3) layer ARN as a public SSM
 # parameter. Reading it with value_from_lookup resolves the current version at
@@ -37,55 +42,87 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # `make refresh-powertools`.
 POWERTOOLS_PARAM = "/aws/service/powertools/python/arm64/python3.12/latest"
 
-# Image used only when a Lambda actually has dependencies to pip-install.
-_BUNDLING_IMAGE = "public.ecr.aws/sam/build-python3.12:latest-arm64"
+# Lambda target platform — pip downloads matching wheels even on an x86/macOS host.
+_PIP_PLATFORM = "manylinux2014_aarch64"
+_PYTHON_VERSION = "3.12"
 
 
 def _installable_requirements(requirements: Path) -> bool:
     """True if requirements.txt has at least one real (non-comment) dependency."""
     if not requirements.exists():
         return False
-    for raw in requirements.read_text().splitlines():
-        line = raw.strip()
-        if line and not line.startswith("#"):
-            return True
-    return False
+    return any(
+        line.strip() and not line.strip().startswith("#")
+        for line in requirements.read_text().splitlines()
+    )
 
 
-@jsii.implements(ILocalBundling)
-class _LocalPipBundling:
-    """Bundle on the host (no Docker) when pip is available."""
+def _copy_tree(src: Path, dst: Path) -> None:
+    shutil.copytree(
+        src,
+        dst,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "requirements.txt"),
+    )
 
-    def __init__(self, entry: Path) -> None:
-        self._entry = entry
 
-    def try_bundle(self, output_dir: str, *, image: DockerImage, **_: Any) -> bool:
-        try:
-            subprocess.run(
-                [
-                    "python",
-                    "-m",
-                    "pip",
-                    "install",
-                    "-r",
-                    str(self._entry / "requirements.txt"),
-                    "--target",
-                    output_dir,
-                    "--quiet",
-                ],
-                check=True,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return False  # fall back to Docker bundling
-        for item in self._entry.iterdir():
+def _pip_install(requirements: Path, target: Path) -> None:
+    subprocess.run(
+        [
+            "python",
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            str(requirements),
+            "--target",
+            str(target),
+            "--platform",
+            _PIP_PLATFORM,
+            "--implementation",
+            "cp",
+            "--python-version",
+            _PYTHON_VERSION,
+            "--only-binary=:all:",
+            "--upgrade",
+            "--quiet",
+        ],
+        check=True,
+    )
+
+
+def _build_bundle(entry_path: Path, *, include_shared: bool, has_deps: bool) -> str:
+    """Stage the Lambda asset on the host and return the staging directory.
+
+    When `include_shared`, the bundle mirrors the repo's `lambdas/` tree (entry at
+    its lambdas-relative path, plus a top-level `shared/`) so the handler's
+    absolute imports (`detectors.iam...`, `shared...`) resolve identically in the
+    repo (mypy/pytest) and in the Lambda runtime. The handler must be referenced
+    by its full dotted path in that case.
+    """
+    slug = entry_path.relative_to(REPO_ROOT).as_posix().replace("/", "_")
+    build_dir = BUILD_ROOT / slug
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    build_dir.mkdir(parents=True)
+
+    if has_deps:
+        _pip_install(entry_path / "requirements.txt", build_dir)
+
+    if include_shared:
+        entry_rel = entry_path.relative_to(REPO_ROOT / "lambdas")
+        _copy_tree(entry_path, build_dir / entry_rel)
+        _copy_tree(SHARED_DIR, build_dir / "shared")
+    else:
+        for item in entry_path.iterdir():
             if item.name in {"requirements.txt", "__pycache__"}:
                 continue
-            dest = Path(output_dir) / item.name
             if item.is_dir():
-                shutil.copytree(item, dest, dirs_exist_ok=True)
+                _copy_tree(item, build_dir / item.name)
             else:
-                shutil.copy2(item, dest)
-        return True
+                shutil.copy2(item, build_dir / item.name)
+
+    return str(build_dir)
 
 
 class PythonLambda(Construct):
@@ -100,6 +137,8 @@ class PythonLambda(Construct):
         timeout: Duration | None = None,
         memory_size: int = 256,
         description: str | None = None,
+        include_shared: bool = False,
+        dead_letter_queue: sqs.IQueue | None = None,
     ) -> None:
         super().__init__(scope, construct_id)
 
@@ -107,22 +146,7 @@ class PythonLambda(Construct):
         if not entry_path.is_dir():
             raise FileNotFoundError(f"Lambda entry directory not found: {entry_path}")
 
-        if _installable_requirements(entry_path / "requirements.txt"):
-            code = lambda_.Code.from_asset(
-                str(entry_path),
-                bundling=BundlingOptions(
-                    image=DockerImage.from_registry(_BUNDLING_IMAGE),
-                    local=_LocalPipBundling(entry_path),
-                    command=[
-                        "bash",
-                        "-c",
-                        "pip install -r requirements.txt -t /asset-output && "
-                        "cp -au . /asset-output",
-                    ],
-                ),
-            )
-        else:
-            code = lambda_.Code.from_asset(str(entry_path))
+        code = self._resolve_code(entry_path, include_shared=include_shared)
 
         # Dedicated log group: 1-day retention, destroyed with the stack.
         log_group = logs.LogGroup(
@@ -162,4 +186,17 @@ class PythonLambda(Construct):
             timeout=timeout or Duration.seconds(30),
             memory_size=memory_size,
             description=description,
+            dead_letter_queue=dead_letter_queue,
         )
+
+    def _resolve_code(self, entry_path: Path, *, include_shared: bool) -> lambda_.Code:
+        # Unit tests set bundle_lambdas=false: skip staging, zip the source as-is.
+        if self.node.try_get_context("bundle_lambdas") is False:
+            return lambda_.Code.from_asset(str(entry_path))
+
+        has_deps = _installable_requirements(entry_path / "requirements.txt")
+        if not has_deps and not include_shared:
+            return lambda_.Code.from_asset(str(entry_path))
+
+        bundle_dir = _build_bundle(entry_path, include_shared=include_shared, has_deps=has_deps)
+        return lambda_.Code.from_asset(bundle_dir)

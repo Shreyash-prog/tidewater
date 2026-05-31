@@ -20,7 +20,8 @@ _DESTROY_BUCKET_IDS = ("RulesYamlBucket", "DashboardSpaBucket")
 
 @pytest.fixture(scope="module")
 def resources() -> dict[str, dict]:
-    app = cdk.App()
+    # Skip host bundling — these assertions are about template structure only.
+    app = cdk.App(context={"bundle_lambdas": False})
     stack = CoreStack(app, "TestCore", env=ENV, notification_email="test@example.com")
     return assertions.Template.from_stack(stack).to_json()["Resources"]
 

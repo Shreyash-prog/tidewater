@@ -3,3 +3,4 @@
 # provides it (and moto pulls it into the local/CI venv for tests).
 pydantic==2.13.4
 aws-lambda-powertools==3.29.0
+PyYAML==6.0.3
