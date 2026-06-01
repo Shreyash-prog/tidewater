@@ -200,22 +200,26 @@ def _process(record: DynamoDBRecord) -> None:
 
     decision, reason = evaluate(rule, finding, datetime.now(UTC))
 
-    # Idempotent: identical decision already recorded → no write, no re-dispatch.
-    if stored_decision == decision.value and status == FindingStatus.OPEN.value:
-        return
+    # Only persist the decision (and its audit record) when it actually changed —
+    # those are the duplicate-noise operations.
+    if stored_decision != decision.value:
+        _write_decision(pk, sk, decision, reason)
+        write_audit_event(
+            event_type="policy_decided",
+            finding_pk=pk,
+            finding_sk=sk,
+            rule_id=finding.rule_id,
+            resource_arn=finding.resource_arn,
+            actor=ACTOR,
+            details={"decision": decision.value, "reason": reason},
+        )
+        logger.info("policy decided", extra={"finding_sk": sk, "decision": decision.value})
 
-    _write_decision(pk, sk, decision, reason)
-    write_audit_event(
-        event_type="policy_decided",
-        finding_pk=pk,
-        finding_sk=sk,
-        rule_id=finding.rule_id,
-        resource_arn=finding.resource_arn,
-        actor=ACTOR,
-        details={"decision": decision.value, "reason": reason},
-    )
+    # Always dispatch — downstream ops (_ensure_approval, _invoke_remediator,
+    # emit_event) are idempotent. This lets the framework reconverge if approvals
+    # were purged or remediation needs retrying, instead of leaving an open
+    # `prompt` finding with no approval row.
     _dispatch(decision, finding, pk, sk)
-    logger.info("policy decided", extra={"finding_sk": sk, "decision": decision.value})
 
 
 @logger.inject_lambda_context
