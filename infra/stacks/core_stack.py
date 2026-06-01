@@ -796,7 +796,8 @@ class CoreStack(Stack):
         )
         pfn = policy_engine.function
         findings_table.grant(pfn, "dynamodb:GetItem", "dynamodb:UpdateItem")
-        approvals_table.grant(pfn, "dynamodb:PutItem", "dynamodb:UpdateItem")
+        # GetItem is needed for the idempotency check in _ensure_approval.
+        approvals_table.grant(pfn, "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem")
         rules_bucket.grant_read(pfn)
         audit_bucket.grant_put(pfn)
         bus.grant_put_events_to(pfn)

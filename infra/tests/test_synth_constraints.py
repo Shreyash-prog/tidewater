@@ -148,3 +148,39 @@ def test_dynamodb_stream_consumers_have_full_stream_read(resources: dict[str, di
         actions = _actions_granted_to_role(resources, role_id)
         missing = _STREAM_READ_ACTIONS - actions
         assert not missing, f"{function_id} is missing stream-read permissions: {sorted(missing)}"
+
+
+def _actions_on_table(resources: dict[str, dict], role_id: str, table_id_prefix: str) -> set[str]:
+    """Actions a role is granted on statements whose Resource references a table."""
+    actions: set[str] = set()
+    for policy in _of_type(resources, "AWS::IAM::Policy").values():
+        roles = policy["Properties"].get("Roles", [])
+        if not any(isinstance(r, dict) and r.get("Ref") == role_id for r in roles):
+            continue
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]:
+            resource = statement.get("Resource", [])
+            resource = resource if isinstance(resource, list) else [resource]
+            refs_table = any(
+                isinstance(r, dict)
+                and isinstance(r.get("Fn::GetAtt"), list)
+                and str(r["Fn::GetAtt"][0]).startswith(table_id_prefix)
+                for r in resource
+            )
+            if refs_table:
+                action = statement.get("Action", [])
+                actions.update([action] if isinstance(action, str) else action)
+    return actions
+
+
+def test_policy_engine_can_getitem_on_approvals_table(resources: dict[str, dict]) -> None:
+    # The idempotency check in _ensure_approval needs GetItem on the approvals
+    # table (a grant that previously only allowed Put/Update — the bug).
+    functions = [
+        name
+        for name, v in _of_type(resources, "AWS::Lambda::Function").items()
+        if name.startswith("PolicyEngineFunction")
+    ]
+    assert len(functions) == 1, functions
+    role_id = _role_id_for_function(resources, functions[0])
+    actions = _actions_on_table(resources, role_id, "ApprovalsTable")
+    assert "dynamodb:GetItem" in actions, f"policy engine lacks GetItem on approvals: {actions}"
