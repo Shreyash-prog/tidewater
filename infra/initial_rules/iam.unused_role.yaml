@@ -5,7 +5,16 @@ threshold:
   idle_days: 7
 forecast:
   enabled: false
+# POC default: 0 lets auto-remediation demo immediately. Production deployments
+# raise this to 14 (the Rule model default) so there's a grace window between
+# first detection and any auto-remediation.
+grace_period_days: 0
 policy:
-  default: dry_run
+  default: prompt
+  overrides:
+    - match: { Environment: nonprod }
+      action: auto
+    - match: { tidewater-skip: "true" }
+      action: skip
 notifications:
   channels: [eventbridge, sns]
