@@ -10,6 +10,7 @@ dashboard. Detector/policy/remediator logic comes in later phases.
 from pathlib import Path
 from typing import Any, cast
 
+import yaml
 from aws_cdk import (
     CfnOutput,
     CfnParameter,
@@ -27,6 +28,8 @@ from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as targets
 from aws_cdk import aws_iam as iam
+from aws_cdk import aws_lambda as lambda_
+from aws_cdk import aws_lambda_event_sources as lambda_event_sources
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_s3_deployment as s3deploy
 from aws_cdk import aws_scheduler as scheduler
@@ -50,6 +53,10 @@ from infra.constructs.lambda_function import PythonLambda
 
 # Directory of rule YAMLs uploaded to the rules-yaml bucket on every deploy.
 INITIAL_RULES_DIR = Path(__file__).resolve().parents[1] / "initial_rules"
+
+# SSM Automation runbooks (repo root / runbooks).
+RUNBOOKS_DIR = Path(__file__).resolve().parents[2] / "runbooks"
+DELETE_IAM_ROLE_DOC_NAME = "TidewaterDeleteIamRole"
 
 # Buckets whose removal policy is RETAIN (the audit trail must survive teardown).
 RETAIN_BUCKETS = {"audit-log", "snapshots"}
@@ -114,6 +121,14 @@ class CoreStack(Stack):
             rules_meta_table=tables["rules_meta"],
             bus=bus,
         )
+        policy_engine_name, remediator_name = self._policy_and_remediation(
+            findings_table=tables["findings"],
+            approvals_table=tables["approvals"],
+            rules_bucket=buckets["rules-yaml"],
+            snapshots_bucket=buckets["snapshots"],
+            audit_bucket=buckets["audit-log"],
+            bus=bus,
+        )
 
         self._outputs(
             tables=tables,
@@ -124,6 +139,8 @@ class CoreStack(Stack):
             notifications_topic=notifications_topic,
             deploy_version=deploy_version,
             iam_detector_name=iam_detector_name,
+            policy_engine_name=policy_engine_name,
+            remediator_name=remediator_name,
         )
 
     # ------------------------------------------------------------------ DynamoDB
@@ -588,6 +605,7 @@ class CoreStack(Stack):
                 actions=[
                     "iam:ListRoles",
                     "iam:GetRole",
+                    "iam:ListRoleTags",
                     "iam:GenerateServiceLastAccessedDetails",
                     "iam:GetServiceLastAccessedDetails",
                 ],
@@ -637,6 +655,151 @@ class CoreStack(Stack):
 
         return fn.function_name
 
+    # ----------------------------------------------------- Policy engine + remediator
+    def _policy_and_remediation(
+        self,
+        *,
+        findings_table: dynamodb.Table,
+        approvals_table: dynamodb.Table,
+        rules_bucket: s3.Bucket,
+        snapshots_bucket: s3.Bucket,
+        audit_bucket: s3.Bucket,
+        bus: events.EventBus,
+    ) -> tuple[str, str]:
+        # --- SSM Automation document + the role it assumes when it runs. ---
+        ssm_role = iam.Role(
+            self,
+            "SsmExecutionRole",
+            role_name="TidewaterSsmExecutionRole",
+            assumed_by=iam.ServicePrincipal("ssm.amazonaws.com"),
+            description="Assumed by the IAM-role-deletion SSM runbook (only its needed perms).",
+        )
+        ssm_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "iam:GetRole",
+                    "iam:ListAttachedRolePolicies",
+                    "iam:ListRolePolicies",
+                    "iam:GetRolePolicy",
+                    "iam:ListInstanceProfilesForRole",
+                    "iam:DetachRolePolicy",
+                    "iam:DeleteRolePolicy",
+                    "iam:RemoveRoleFromInstanceProfile",
+                    "iam:DeleteRole",
+                ],
+                resources=[
+                    f"arn:aws:iam::{self.account}:role/*",
+                    f"arn:aws:iam::{self.account}:instance-profile/*",
+                ],
+            )
+        )
+        snapshots_bucket.grant_put(ssm_role)
+        audit_bucket.grant_put(ssm_role)
+        findings_table.grant(ssm_role, "dynamodb:UpdateItem")
+        bus.grant_put_events_to(ssm_role)
+        ssm_role.add_to_policy(
+            iam.PolicyStatement(actions=["ssm:GetAutomationExecution"], resources=["*"])
+        )
+
+        runbook_content = yaml.safe_load((RUNBOOKS_DIR / "delete_iam_role.yml").read_text())
+        ssm.CfnDocument(
+            self,
+            "DeleteIamRoleDocument",
+            name=DELETE_IAM_ROLE_DOC_NAME,
+            document_type="Automation",
+            content=runbook_content,
+        )
+        document_arn = (
+            f"arn:aws:ssm:{self.region}:{self.account}"
+            f":automation-definition/{DELETE_IAM_ROLE_DOC_NAME}:*"
+        )
+
+        # --- Remediator Lambda (starts SSM Automation; never deletes directly). ---
+        remediator_dlq = sqs.Queue(
+            self, "RemediatorDlq", queue_name="remediator-dlq", retention_period=Duration.days(14)
+        )
+        remediator = PythonLambda(
+            self,
+            "Remediator",
+            entry="lambdas/remediator",
+            handler="remediator.handler.handler",
+            include_shared=True,
+            memory_size=256,
+            timeout=Duration.minutes(1),
+            dead_letter_queue=remediator_dlq,
+            environment={
+                "FINDINGS_TABLE": findings_table.table_name,
+                "SNAPSHOT_BUCKET": snapshots_bucket.bucket_name,
+                "AUDIT_BUCKET": audit_bucket.bucket_name,
+                "EVENT_BUS_NAME": bus.event_bus_name,
+                "SSM_DOCUMENT_NAME": DELETE_IAM_ROLE_DOC_NAME,
+                "SSM_EXECUTION_ROLE_ARN": ssm_role.role_arn,
+            },
+            description="Dispatches SSM Automation remediations (auto or approved).",
+        )
+        rfn = remediator.function
+        findings_table.grant(rfn, "dynamodb:GetItem", "dynamodb:UpdateItem")
+        audit_bucket.grant_put(rfn)
+        bus.grant_put_events_to(rfn)
+        rfn.add_to_role_policy(
+            iam.PolicyStatement(actions=["ssm:StartAutomationExecution"], resources=[document_arn])
+        )
+        rfn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["iam:PassRole"],
+                resources=[ssm_role.role_arn],
+                conditions={"StringEquals": {"iam:PassedToService": "ssm.amazonaws.com"}},
+            )
+        )
+
+        # --- Policy engine Lambda (DynamoDB Streams consumer). ---
+        policy_dlq = sqs.Queue(
+            self,
+            "PolicyEngineDlq",
+            queue_name="policy-engine-dlq",
+            retention_period=Duration.days(14),
+        )
+        policy_engine = PythonLambda(
+            self,
+            "PolicyEngine",
+            entry="lambdas/policy_engine",
+            handler="policy_engine.handler.handler",
+            include_shared=True,
+            memory_size=512,
+            timeout=Duration.minutes(2),
+            dead_letter_queue=policy_dlq,
+            environment={
+                "FINDINGS_TABLE": findings_table.table_name,
+                "APPROVALS_TABLE": approvals_table.table_name,
+                "RULES_BUCKET": rules_bucket.bucket_name,
+                "REMEDIATOR_FUNCTION_NAME": rfn.function_name,
+                "EVENT_BUS_NAME": bus.event_bus_name,
+                "AUDIT_BUCKET": audit_bucket.bucket_name,
+            },
+            description="Decides auto/prompt/dry_run/skip per finding (DynamoDB Streams).",
+        )
+        pfn = policy_engine.function
+        findings_table.grant(pfn, "dynamodb:GetItem", "dynamodb:UpdateItem")
+        approvals_table.grant(pfn, "dynamodb:PutItem", "dynamodb:UpdateItem")
+        rules_bucket.grant_read(pfn)
+        audit_bucket.grant_put(pfn)
+        bus.grant_put_events_to(pfn)
+        rfn.grant_invoke(pfn)  # explicit function ARN, no wildcard
+
+        pfn.add_event_source(
+            lambda_event_sources.DynamoEventSource(
+                findings_table,
+                starting_position=lambda_.StartingPosition.LATEST,
+                batch_size=10,
+                max_batching_window=Duration.seconds(5),
+                retry_attempts=2,
+                report_batch_item_failures=True,
+                on_failure=lambda_event_sources.SqsDlq(policy_dlq),
+            )
+        )
+
+        return pfn.function_name, rfn.function_name
+
     # ------------------------------------------------------------------ Outputs
     def _outputs(
         self,
@@ -649,9 +812,14 @@ class CoreStack(Stack):
         notifications_topic: sns.Topic,
         deploy_version: CfnParameter,
         iam_detector_name: str,
+        policy_engine_name: str,
+        remediator_name: str,
     ) -> None:
         outputs: dict[str, str] = {
             "IamDetectorLambdaName": iam_detector_name,
+            "PolicyEngineLambdaName": policy_engine_name,
+            "RemediatorLambdaName": remediator_name,
+            "SsmDocumentName": DELETE_IAM_ROLE_DOC_NAME,
             "DashboardUrl": f"https://{distribution.distribution_domain_name}",
             "ApiUrl": api_url,
             "FindingsTableName": tables["findings"].table_name,

@@ -1,3 +1,5 @@
 # CDK app dependencies. Pinned; see requirements-dev.txt for the rationale.
 aws-cdk-lib==2.257.0
 constructs==10.6.0
+# Used at synth time to load the SSM Automation runbook YAML into a CfnDocument.
+PyYAML==6.0.3

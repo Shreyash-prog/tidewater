@@ -33,6 +33,13 @@ class FindingStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class ApprovalStatus(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
 class Finding(BaseModel):
     account: str
     region: str
@@ -45,12 +52,29 @@ class Finding(BaseModel):
     last_seen_at: datetime
     details: dict[str, Any]
     policy_decision: PolicyAction | None = None
+    decision_reason: str | None = None
+
+
+class Approval(BaseModel):
+    approval_id: str  # ULID
+    finding_pk: str
+    finding_sk: str
+    requested_at: datetime
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    decided_by: str | None = None
+    decided_at: datetime | None = None
+    reason: str | None = None
 
 
 class RuleOverride(BaseModel):
-    match: dict[str, str]  # e.g. {"tag.Environment": "nonprod"}
+    match: dict[str, str]  # e.g. {"Environment": "nonprod"} — matched against resource tags
     action: PolicyAction
     approvers: list[str] = Field(default_factory=list)
+
+
+class PolicyConfig(BaseModel):
+    default: PolicyAction = PolicyAction.PROMPT
+    overrides: list[RuleOverride] = Field(default_factory=list)
 
 
 class ForecastConfig(BaseModel):
@@ -64,6 +88,8 @@ class Rule(BaseModel):
     schedule: str = "rate(1 hour)"
     threshold: dict[str, Any]
     forecast: ForecastConfig = Field(default_factory=ForecastConfig)
-    policy_default: PolicyAction = Field(alias="policy.default", default=PolicyAction.PROMPT)
-    overrides: list[RuleOverride] = Field(default_factory=list)
+    # 14-day grace period between first detection and auto-remediation (CLAUDE.md
+    # safety rule). Defaulted here; a rule YAML may override (POC uses 0 to demo).
+    grace_period_days: int = 14
+    policy: PolicyConfig = Field(default_factory=PolicyConfig)
     notifications_channels: list[str] = Field(default_factory=lambda: ["eventbridge", "sns"])

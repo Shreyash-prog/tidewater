@@ -72,7 +72,7 @@ def test_loads_enabled_iam_rule() -> None:
     rule = rules[0]
     assert rule.rule_id == "iam.unused_role"
     assert rule.threshold == {"idle_days": 7}
-    assert rule.policy_default is PolicyAction.DRY_RUN
+    assert rule.policy.default is PolicyAction.DRY_RUN
     assert rule.notifications_channels == ["eventbridge", "sns"]
 
 

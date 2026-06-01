@@ -57,11 +57,12 @@ def _rules_bucket() -> str:
 
 
 def _to_rule(raw: dict[str, Any]) -> Rule:
-    """Map the on-disk YAML shape onto the aliased Rule model fields."""
+    """Map the on-disk YAML shape onto the Rule model fields.
+
+    `policy` (default + overrides) and `forecast` map directly onto their nested
+    models; only `notifications.channels` needs flattening to a model field.
+    """
     data = dict(raw)
-    policy = data.pop("policy", None)
-    if isinstance(policy, dict) and "default" in policy:
-        data["policy.default"] = policy["default"]
     notifications = data.pop("notifications", None)
     if isinstance(notifications, dict) and "channels" in notifications:
         data["notifications_channels"] = notifications["channels"]
