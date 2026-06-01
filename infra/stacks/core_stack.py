@@ -709,10 +709,16 @@ class CoreStack(Stack):
             document_type="Automation",
             content=runbook_content,
         )
-        document_arn = (
-            f"arn:aws:ssm:{self.region}:{self.account}"
-            f":automation-definition/{DELETE_IAM_ROLE_DOC_NAME}:*"
-        )
+        # ssm:StartAutomationExecution is authorized against the document/ ARN today;
+        # the automation-definition/ format is being deprecated (kept for backward
+        # compat per AWS migration guidance), and automation-execution/ is needed
+        # once a run starts. This mirrors AWS's own
+        # AWS-SSM-DiagnosisAutomation-AdministrationRolePolicy.
+        start_automation_resources = [
+            f"arn:aws:ssm:{self.region}:{self.account}:document/{DELETE_IAM_ROLE_DOC_NAME}",
+            f"arn:aws:ssm:{self.region}:{self.account}:automation-execution/*",
+            f"arn:aws:ssm:{self.region}:{self.account}:automation-definition/{DELETE_IAM_ROLE_DOC_NAME}:*",
+        ]
 
         # --- Remediator Lambda (starts SSM Automation; never deletes directly). ---
         remediator_dlq = sqs.Queue(
@@ -742,7 +748,17 @@ class CoreStack(Stack):
         audit_bucket.grant_put(rfn)
         bus.grant_put_events_to(rfn)
         rfn.add_to_role_policy(
-            iam.PolicyStatement(actions=["ssm:StartAutomationExecution"], resources=[document_arn])
+            iam.PolicyStatement(
+                actions=["ssm:StartAutomationExecution"],
+                resources=start_automation_resources,
+            )
+        )
+        # Poll execution status (execution IDs aren't known until runtime).
+        rfn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["ssm:GetAutomationExecution"],
+                resources=[f"arn:aws:ssm:{self.region}:{self.account}:automation-execution/*"],
+            )
         )
         rfn.add_to_role_policy(
             iam.PolicyStatement(
