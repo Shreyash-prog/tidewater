@@ -802,6 +802,13 @@ class CoreStack(Stack):
         bus.grant_put_events_to(pfn)
         rfn.grant_invoke(pfn)  # explicit function ARN, no wildcard
 
+        # Grant the four stream-read permissions explicitly (ListStreams +
+        # DescribeStream + GetRecords + GetShardIterator). DynamoEventSource also
+        # grants these, but binding them to the role independently of the event
+        # source means a refactor of the mapping can't silently drop them — the
+        # poller fails closed-and-loud rather than never delivering records.
+        findings_table.grant_stream_read(pfn)
+
         pfn.add_event_source(
             lambda_event_sources.DynamoEventSource(
                 findings_table,
