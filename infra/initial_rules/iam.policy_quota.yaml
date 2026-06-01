@@ -1,0 +1,16 @@
+rule: iam.policy_quota
+enabled: true
+schedule: on-demand
+threshold:
+  attached_count_threshold: 8
+forecast:
+  enabled: true
+  alert_at_days_remaining: 14
+grace_period_days: 0
+policy:
+  default: prompt
+  overrides:
+    - match: { Environment: nonprod }
+      action: auto
+notifications:
+  channels: [eventbridge, sns]

@@ -16,7 +16,12 @@ from aws_lambda_powertools import Logger, Metrics, Tracer
 from aws_lambda_powertools.metrics import MetricUnit
 from aws_lambda_powertools.utilities.typing import LambdaContext
 
+from detectors.iam.detectors.orphaned_trust import OrphanedTrustDetector
+from detectors.iam.detectors.policy_quota import PolicyQuotaDetector
+from detectors.iam.detectors.stale_access_key import StaleAccessKeyDetector
+from detectors.iam.detectors.unused_policy import UnusedPolicyDetector
 from detectors.iam.detectors.unused_role import UnusedRoleDetector
+from detectors.iam.detectors.wildcard_policy import WildcardPolicyDetector
 from shared.detector_base import Detector
 from shared.event_emitter import emit_finding_event
 from shared.findings_writer import FindingsTableWriter
@@ -29,9 +34,14 @@ metrics = Metrics()
 
 SERVICE = "iam"
 
-# rule_id -> detector class. Grows in Phase 5.
+# rule_id -> detector class.
 REGISTRY: dict[str, type[Detector]] = {
     "iam.unused_role": UnusedRoleDetector,
+    "iam.wildcard_policy": WildcardPolicyDetector,
+    "iam.stale_access_key": StaleAccessKeyDetector,
+    "iam.orphaned_trust": OrphanedTrustDetector,
+    "iam.unused_policy": UnusedPolicyDetector,
+    "iam.policy_quota": PolicyQuotaDetector,
 }
 
 

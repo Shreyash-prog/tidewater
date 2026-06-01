@@ -1,0 +1,16 @@
+rule: iam.stale_access_key
+enabled: true
+schedule: on-demand
+threshold:
+  # POC demo: -1 flags any active key idle >= 0 days. Production uses 90.
+  idle_days: -1
+forecast:
+  enabled: false
+grace_period_days: 0
+policy:
+  default: prompt
+  overrides:
+    - match: { Environment: nonprod }
+      action: auto
+notifications:
+  channels: [eventbridge, sns]

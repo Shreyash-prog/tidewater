@@ -1,0 +1,16 @@
+rule: iam.unused_policy
+enabled: true
+schedule: on-demand
+threshold:
+  # Attachment count is the gate; no numeric threshold.
+  enabled: true
+forecast:
+  enabled: false
+grace_period_days: 0
+policy:
+  default: prompt
+  overrides:
+    - match: { Environment: nonprod }
+      action: auto
+notifications:
+  channels: [eventbridge, sns]

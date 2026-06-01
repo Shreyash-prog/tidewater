@@ -1,0 +1,13 @@
+rule: iam.wildcard_policy
+enabled: true
+schedule: on-demand
+threshold:
+  # No threshold for this rule; pattern matching is the gate.
+  enabled: true
+forecast:
+  enabled: false
+grace_period_days: 0
+policy:
+  default: prompt # ALWAYS prompt for wildcard findings — never auto (no overrides).
+notifications:
+  channels: [eventbridge, sns]
