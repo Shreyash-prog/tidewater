@@ -2,7 +2,9 @@ rule: iam.unused_role
 enabled: true
 schedule: on-demand
 threshold:
-  idle_days: 7
+  # POC demo: -1 means any role with days_idle >= 0 flags immediately. Production
+  # deployments use 7+ days.
+  idle_days: -1
 forecast:
   enabled: false
 # POC default: 0 lets auto-remediation demo immediately. Production deployments

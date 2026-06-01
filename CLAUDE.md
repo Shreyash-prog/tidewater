@@ -48,6 +48,7 @@ This is a POC of a platform hygiene framework for AWS. You are helping build it.
 - A service handler keeps a `REGISTRY` mapping `rule_id -> Detector` class; unknown rule_ids are logged and skipped. Emit one EventBridge event per created/updated finding via `shared.event_emitter`.
 - Detector code that imports `shared` must be packaged with `include_shared=True` on `PythonLambda` and referenced by its full dotted handler path (e.g. `detectors.iam.handler.handler`) so repo and bundle imports match.
 - Phase 3 is **on-demand only** (no EventBridge Schedule) and hard-codes `policy_decision = dry_run`; the policy engine arrives in Phase 4.
+- ⚠️ **The shipped POC rule values are demo-only and unsafe in production.** `infra/initial_rules/iam.unused_role.yaml` uses `idle_days: -1` (flags any role idle ≥ 0 days, so the demo runs in seconds), `grace_period_days: 0` (no window before auto-remediation), and an `Environment=nonprod → auto` override. Production rules use `idle_days` of 7–90, `grace_period_days` ≥ 14, and `prompt` (human review) rather than `auto`. See README "POC vs Production".
 
 ## Workflow
 

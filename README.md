@@ -159,6 +159,23 @@ See `docs/`:
 
 This POC uses a pre-shared bearer token stored in browser localStorage for dashboard auth. This is deliberately simple for demo purposes and **must not** be exposed to the public internet. The roadmap moves auth to AWS Cognito.
 
+## POC vs Production
+
+Several settings are tuned for a fast, self-contained demo and are **intentionally
+unsafe for real accounts**. They're consistent with the "do not deploy publicly"
+guidance above — flip them before any production use:
+
+| Setting | POC (demo) | Production |
+|---|---|---|
+| `iam.unused_role` `threshold.idle_days` | **-1** (flags any role idle ≥ 0 days, so create→detect→remediate runs in seconds) | 7–90 days |
+| `iam.unused_role` `grace_period_days` | **0** (auto-remediates immediately) | ≥ 14 days |
+| Policy override `Environment=nonprod` | **auto** (auto-remediates nonprod roles) | `prompt` (human review/approval) |
+| Dashboard auth | Pre-shared bearer token in `localStorage` | AWS Cognito |
+
+The rule values live in `infra/initial_rules/iam.unused_role.yaml`; the demo-only
+defaults are pinned by `infra/tests/test_initial_rules.py` so changing them is a
+deliberate, reviewed act.
+
 ## License
 
 MIT — see `LICENSE`.
