@@ -12,9 +12,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 import boto3
+from aws_lambda_powertools import Logger
 
 from shared.detector_base import Detector
 from shared.models import Finding, Severity
+
+logger = Logger(child=True)
 
 # Roles we never flag or delete. Matched against the role name and, for
 # service-linked roles, the role path.
@@ -27,8 +30,6 @@ _SKIP_NAME_PREFIXES = (
     "aws-service-role/",
 )
 _SKIP_PATH_PREFIXES = ("/aws-service-role/",)
-
-DEFAULT_IDLE_DAYS = 7
 
 
 def _aware(dt: datetime) -> datetime:
@@ -58,8 +59,38 @@ class UnusedRoleDetector(Detector):
             return True
         return any(name.startswith(p) for p in _SKIP_NAME_PREFIXES)
 
+    def _resolve_idle_days(self) -> int | None:
+        """Return the configured idle_days, or None (logged) if absent/invalid.
+
+        The threshold MUST come from the rule YAML — there is no fallback constant.
+        A misconfigured rule fails closed (no findings) and is visible in logs,
+        rather than silently using some default.
+        """
+        raw = self.threshold.get("idle_days")
+        if raw is None:
+            logger.warning(
+                "iam.unused_role: idle_days not configured in rule threshold; skipping run",
+                extra={"rule_id": self.rule_id, "threshold": self.threshold},
+            )
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "iam.unused_role: idle_days is not an integer; skipping run",
+                extra={"rule_id": self.rule_id, "idle_days_raw": raw},
+            )
+            return None
+
     def scan(self) -> Iterator[Finding]:
-        idle_days = int(self.threshold.get("idle_days", DEFAULT_IDLE_DAYS))
+        idle_days = self._resolve_idle_days()
+        if idle_days is None:
+            return
+        # Surface the loaded threshold in CloudWatch so misconfiguration is visible.
+        logger.info(
+            "iam.unused_role: evaluating roles",
+            extra={"rule_id": self.rule_id, "idle_days": idle_days},
+        )
         now = datetime.now(UTC)
         for page in self.iam.get_paginator("list_roles").paginate():
             for role in page.get("Roles", []):

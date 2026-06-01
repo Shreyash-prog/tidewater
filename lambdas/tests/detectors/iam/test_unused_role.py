@@ -179,3 +179,53 @@ def test_includes_role_tags_in_details() -> None:
 
     # Tags drive tag-based policy decisions in the policy engine.
     assert finding.details["tags"] == {"Environment": "nonprod", "team": "platform"}
+
+
+@mock_aws
+def test_threshold_is_loaded_from_rule_not_a_constant() -> None:
+    # Same role, last used 5 days ago. The configured idle_days — not any
+    # hardcoded default — must decide whether it's flagged.
+    client: Any = boto3.client("iam", region_name=REGION)
+    _make_role(client, "five-days")
+    client.get_role = _fake_get_role({"five-days": {"create_days": 100, "last_used_days": 5}})
+
+    # idle_days=3 → 5 > 3 → flagged, and details echo the configured threshold.
+    flagged = list(_detector(client, idle_days=3).scan())
+    assert len(flagged) == 1
+    assert flagged[0].details["threshold_idle_days"] == 3
+
+    # idle_days=10 → 5 <= 10 → not flagged.
+    assert list(_detector(client, idle_days=10).scan()) == []
+
+
+@mock_aws
+def test_threshold_idle_days_in_details_matches_config() -> None:
+    client: Any = boto3.client("iam", region_name=REGION)
+    _make_role(client, "never-used-old")
+    client.get_role = _fake_get_role(
+        {"never-used-old": {"create_days": 60, "last_used_days": None}}
+    )
+
+    finding = next(iter(_detector(client, idle_days=30).scan()))
+    assert finding.details["threshold_idle_days"] == 30  # never -1 / never a fallback
+
+
+@mock_aws
+def test_missing_idle_days_skips_run_no_fallback() -> None:
+    # No idle_days in the rule threshold → fail closed (no findings), not default-7.
+    client: Any = boto3.client("iam", region_name=REGION)
+    _make_role(client, "old-unused")
+    client.get_role = _fake_get_role({"old-unused": {"create_days": 365, "last_used_days": None}})
+
+    detector = UnusedRoleDetector(ACCOUNT, REGION, {}, iam_client=client)
+    assert list(detector.scan()) == []
+
+
+@mock_aws
+def test_non_integer_idle_days_skips_run() -> None:
+    client: Any = boto3.client("iam", region_name=REGION)
+    _make_role(client, "old-unused")
+    client.get_role = _fake_get_role({"old-unused": {"create_days": 365, "last_used_days": None}})
+
+    detector = UnusedRoleDetector(ACCOUNT, REGION, {"idle_days": "oops"}, iam_client=client)
+    assert list(detector.scan()) == []
