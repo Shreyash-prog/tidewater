@@ -165,3 +165,57 @@ def test_at_most_one_approval_per_finding_across_reruns(aws: Any) -> None:
     pe.handler(_event(modified), _context())
     assert _approval_count(aws.approvals) == 1
     assert aws.approvals.scan()["Items"][0]["approval_id"] == first_id
+
+
+def test_dispatch_runs_when_decision_unchanged_recreates_missing_approval(aws: Any) -> None:
+    # The PR #15 bug: finding already in `prompt`, approvals purged. Re-processing
+    # must still dispatch and create the approval — decide and dispatch are separate.
+    item = _finding_item(last_seen_at=datetime.now(UTC).isoformat())
+    item["policy_decision"] = "prompt"  # decision already recorded
+    aws.findings.put_item(Item=item)
+    assert _approval_count(aws.approvals) == 0
+
+    pe.handler(_event(item), _context())
+
+    assert _approval_count(aws.approvals) == 1  # dispatch ran despite no decision change
+
+
+def test_unchanged_decision_does_not_rewrite_but_still_dispatches(
+    aws: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_spy = _Spy()
+    monkeypatch.setattr(pe, "_write_decision", write_spy)
+
+    item = _finding_item(last_seen_at=datetime.now(UTC).isoformat())
+    item["policy_decision"] = "prompt"  # matches the computed decision → no rewrite
+    aws.findings.put_item(Item=item)
+
+    pe.handler(_event(item), _context())
+
+    assert write_spy.calls == 0  # unchanged decision → no duplicate write/audit
+    assert _approval_count(aws.approvals) == 1  # but dispatch still happened
+
+
+def test_reprocessing_prompt_still_calls_ensure_approval(
+    aws: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _finding_item(last_seen_at=datetime.now(UTC).isoformat())  # stored dry_run
+    aws.findings.put_item(Item=item)
+    pe.handler(_event(item), _context())  # dry_run -> prompt: creates the approval
+    assert _approval_count(aws.approvals) == 1
+
+    calls: list[tuple[str, str]] = []
+    original = pe._ensure_approval
+
+    def _recording_ensure(finding: Any, pk: str, sk: str) -> None:
+        calls.append((pk, sk))
+        original(finding, pk, sk)
+
+    monkeypatch.setattr(pe, "_ensure_approval", _recording_ensure)
+
+    # Re-process with the decision already `prompt`: dispatch must still invoke
+    # _ensure_approval (which no-ops because the row exists), not skip it.
+    item["policy_decision"] = "prompt"
+    pe.handler(_event(item), _context())
+    assert calls == [(PK, SK)]
+    assert _approval_count(aws.approvals) == 1  # idempotent: no duplicate

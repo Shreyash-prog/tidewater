@@ -267,12 +267,13 @@ def test_skip_path_marks_finding_skipped(aws: Any) -> None:
     assert pe.emit_event.calls[0][0][0] == "finding.skipped"
 
 
-def test_idempotent_reevaluation_does_not_redispatch(aws: Any) -> None:
+def test_reevaluation_of_unchanged_prompt_ensures_single_approval(aws: Any) -> None:
     # Finding already carries the decision the engine would compute (prompt).
     item = _put_finding(aws.findings, tags={}, decision="prompt")
     pe.handler(_stream_event(item, event_name="MODIFY"), _context())
 
-    # Same decision → no approval, no remediator invoke, no event.
-    assert aws.approvals.scan()["Count"] == 0
+    # Decide and dispatch are separate: an unchanged decision still dispatches, so
+    # the (single, idempotent) approval is ensured — but the remediator is never
+    # invoked for a prompt decision.
+    assert aws.approvals.scan()["Count"] == 1
     assert pe._invoke_remediator.calls == []
-    assert pe.emit_event.calls == []

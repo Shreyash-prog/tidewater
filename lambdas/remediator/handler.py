@@ -68,6 +68,16 @@ def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, Any]:
         logger.error("finding not found; nothing to remediate", extra={"finding_sk": sk})
         return {"status": "not_found"}
 
+    # Idempotent re-invocation guard: don't start a second SSM execution for a
+    # finding that's already being remediated or is done.
+    status = str(item.get("status", ""))
+    if status in (FindingStatus.IN_REMEDIATION.value, FindingStatus.RESOLVED.value):
+        logger.info(
+            "finding already being remediated or resolved, skipping",
+            extra={"finding_pk": pk, "finding_sk": sk, "status": status},
+        )
+        return {"status": "already_in_progress", "finding_status": status}
+
     rule_id = str(item["rule_id"])
     resource_arn = str(item["resource_arn"])
 
