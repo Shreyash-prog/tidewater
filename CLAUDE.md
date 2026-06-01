@@ -50,6 +50,11 @@ This is a POC of a platform hygiene framework for AWS. You are helping build it.
 - Phase 3 is **on-demand only** (no EventBridge Schedule) and hard-codes `policy_decision = dry_run`; the policy engine arrives in Phase 4.
 - ⚠️ **The shipped POC rule values are demo-only and unsafe in production.** `infra/initial_rules/iam.unused_role.yaml` uses `idle_days: -1` (flags any role idle ≥ 0 days, so the demo runs in seconds), `grace_period_days: 0` (no window before auto-remediation), and an `Environment=nonprod → auto` override. Production rules use `idle_days` of 7–90, `grace_period_days` ≥ 14, and `prompt` (human review) rather than `auto`. See README "POC vs Production".
 
+### Approval idempotency
+
+- **One approval per finding, ever.** Approval rows are keyed by a deterministic id — `appr_` + the first 24 hex chars of `sha256("{finding_pk}|{finding_sk}")` (`policy_engine.handler.approval_id_for`) — so the idempotency check is a single `GetItem`, with no GSI. The policy engine re-dispatches `prompt` whenever a finding's stored `policy_decision` differs from the computed one (the detector resets it to `dry_run` on each run), so approval creation **must** be idempotent: if a pending approval already exists, log and skip — never create a second.
+- Approvals already in `approved`/`rejected`/`expired` are **preserved**. If a finding returns to `prompt`, the policy engine logs a warning and does **not** create a new approval or re-open the old one. Re-opening previously-decided findings is **future dashboard work** (Phase 9+).
+
 ## Workflow
 
 - All work happens on feature branches; PRs go to `main` (branch protection enforced).

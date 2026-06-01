@@ -11,6 +11,7 @@ what's already stored, so the write-back's own stream event terminates the loop.
 Uses Powertools BatchProcessor for partial-batch-failure semantics.
 """
 
+import hashlib
 import json
 import os
 from datetime import UTC, datetime, timedelta
@@ -29,11 +30,11 @@ from aws_lambda_powertools.utilities.data_classes.dynamo_db_stream_event import 
     DynamoDBRecordEventName,
 )
 from aws_lambda_powertools.utilities.typing import LambdaContext
+from botocore.exceptions import ClientError
 
 from shared.audit import write_audit_event
 from shared.event_emitter import emit_event
-from shared.identifiers import new_ulid
-from shared.models import Approval, Finding, FindingStatus, PolicyAction, Rule
+from shared.models import Approval, ApprovalStatus, Finding, FindingStatus, PolicyAction, Rule
 from shared.rule_loader import load_enabled_rules_for_service
 
 logger = Logger()
@@ -105,34 +106,73 @@ def _invoke_remediator(pk: str, sk: str, rule_id: str) -> None:
     )
 
 
+def approval_id_for(finding_pk: str, finding_sk: str) -> str:
+    """Deterministic approval id from a finding's identity.
+
+    One approval per (finding_pk, finding_sk) ever — keying the row on this hash
+    turns the idempotency check into a single GetItem and makes a duplicate
+    create impossible. Prefixed `appr_` so it's visually distinct from a ULID.
+    """
+    digest = hashlib.sha256(f"{finding_pk}|{finding_sk}".encode()).hexdigest()[:24]
+    return f"appr_{digest}"
+
+
+def _ensure_approval(finding: Finding, pk: str, sk: str) -> None:
+    """Create exactly one pending approval per finding (idempotent)."""
+    approval_id = approval_id_for(pk, sk)
+    table = _approvals_table()
+    existing = table.get_item(Key={"approval_id": approval_id, "metadata": "metadata"}).get("Item")
+    if existing is not None:
+        if existing.get("status") == ApprovalStatus.PENDING.value:
+            logger.info(
+                "approval already exists, skipping creation",
+                extra={"approval_id": approval_id},
+            )
+        else:
+            logger.warning(
+                "finding was previously approved/rejected; not re-creating approval — "
+                "should this be re-opened?",
+                extra={"approval_id": approval_id, "approval_status": existing.get("status")},
+            )
+        return
+
+    approval = Approval(
+        approval_id=approval_id, finding_pk=pk, finding_sk=sk, requested_at=datetime.now(UTC)
+    )
+    item = approval.model_dump(mode="json")
+    item["metadata"] = "metadata"  # table sort key
+    try:
+        table.put_item(Item=item, ConditionExpression="attribute_not_exists(approval_id)")
+    except ClientError as exc:
+        # Lost a race to another invocation — the approval already exists; that's fine.
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            logger.info(
+                "approval created concurrently, skipping", extra={"approval_id": approval_id}
+            )
+            return
+        raise
+    emit_event(
+        "approval.requested",
+        {"approval_id": approval_id, **finding.model_dump(mode="json")},
+        source=SOURCE,
+    )
+    write_audit_event(
+        event_type="approval_requested",
+        finding_pk=pk,
+        finding_sk=sk,
+        rule_id=finding.rule_id,
+        resource_arn=finding.resource_arn,
+        actor=ACTOR,
+        details={"approval_id": approval_id},
+    )
+
+
 def _dispatch(decision: PolicyAction, finding: Finding, pk: str, sk: str) -> None:
     if decision is PolicyAction.AUTO:
         _invoke_remediator(pk, sk, finding.rule_id)
         logger.info("dispatched auto-remediation", extra={"finding_sk": sk})
     elif decision is PolicyAction.PROMPT:
-        approval = Approval(
-            approval_id=new_ulid(),
-            finding_pk=pk,
-            finding_sk=sk,
-            requested_at=datetime.now(UTC),
-        )
-        item = approval.model_dump(mode="json")
-        item["metadata"] = "metadata"  # table sort key
-        _approvals_table().put_item(Item=item)
-        emit_event(
-            "approval.requested",
-            {"approval_id": approval.approval_id, **finding.model_dump(mode="json")},
-            source=SOURCE,
-        )
-        write_audit_event(
-            event_type="approval_requested",
-            finding_pk=pk,
-            finding_sk=sk,
-            rule_id=finding.rule_id,
-            resource_arn=finding.resource_arn,
-            actor=ACTOR,
-            details={"approval_id": approval.approval_id},
-        )
+        _ensure_approval(finding, pk, sk)
     elif decision is PolicyAction.SKIP:
         emit_event("finding.skipped", finding.model_dump(mode="json"), source=SOURCE)
 
