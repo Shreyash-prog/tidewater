@@ -73,3 +73,32 @@ def test_findings_table_has_a_stream(resources: dict[str, dict]) -> None:
         if "StreamSpecification" in t["Properties"]
     ]
     assert len(streamed) == 1 and streamed[0].startswith("FindingsTable")
+
+
+def _statements_with_action(resources: dict[str, dict], action: str) -> list[dict]:
+    statements: list[dict] = []
+    for policy in _of_type(resources, "AWS::IAM::Policy").values():
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]:
+            actions = statement.get("Action", [])
+            actions = [actions] if isinstance(actions, str) else actions
+            if action in actions:
+                statements.append(statement)
+    return statements
+
+
+def test_start_automation_grants_document_and_execution_arns(resources: dict[str, dict]) -> None:
+    # ssm:StartAutomationExecution is authorized against the document/ ARN today;
+    # granting only automation-definition/ caused an AccessDenied at runtime.
+    statements = _statements_with_action(resources, "ssm:StartAutomationExecution")
+    assert statements, "expected a ssm:StartAutomationExecution grant"
+
+    arns: list[str] = []
+    for statement in statements:
+        resource = statement.get("Resource", [])
+        resource = [resource] if isinstance(resource, str) else resource
+        arns.extend(arn for arn in resource if isinstance(arn, str))
+
+    assert any(":document/" in arn for arn in arns), f"missing document/ ARN in {arns}"
+    assert any(":automation-execution/" in arn for arn in arns), (
+        f"missing automation-execution/ ARN in {arns}"
+    )
