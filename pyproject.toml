@@ -38,7 +38,9 @@ pythonpath = ["lambdas", "."]
 testpaths = ["tests", "lambdas/tests", "infra/tests"]
 # Smoke tests need real AWS credentials and a deployed stack — excluded from the
 # default run; `make smoke` selects them explicitly.
-addopts = "-q -m 'not smoke'"
+# importlib mode lets same-named test modules (e.g. several test_handler.py)
+# coexist across the per-component test packages.
+addopts = "-q -m 'not smoke' --import-mode=importlib"
 markers = [
     "smoke: integration test requiring real AWS credentials and a deployed stack",
 ]

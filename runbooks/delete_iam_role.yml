@@ -1,0 +1,373 @@
+schemaVersion: "0.3"
+description: >-
+  Tidewater: delete an unused IAM role after taking a complete JSON snapshot to
+  S3. Snapshot-before-delete is enforced by step ordering — if writeSnapshotToS3
+  fails the automation aborts and no deletion step runs. Refuses protected
+  (AWS-managed / service-linked) roles as a final guardrail.
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  RoleName:
+    type: String
+    description: Name of the IAM role to snapshot and delete.
+  SnapshotBucket:
+    type: String
+    description: S3 bucket for the pre-deletion snapshot.
+  AuditBucket:
+    type: String
+    description: S3 bucket for the JSONL audit trail.
+  FindingsTableName:
+    type: String
+    description: DynamoDB findings table to mark resolved.
+  FindingPk:
+    type: String
+    description: Partition key of the finding.
+  FindingSk:
+    type: String
+    description: Sort key of the finding.
+  EventBusName:
+    type: String
+    description: EventBridge bus for the finding.remediated event.
+  AutomationAssumeRole:
+    type: String
+    description: IAM role this automation assumes (TidewaterSsmExecutionRole).
+mainSteps:
+  # --- Guardrail: never touch a protected role, even if invoked with one. ---
+  - name: assertRoleNotProtected
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+      Script: |
+        def handler(events, context):
+            name = events["RoleName"]
+            name_prefixes = (
+                "AWSReservedSSO_",
+                "cdk-hnb659fds-",
+                "StackSet-",
+                "OrganizationAccountAccessRole",
+                "aws-controltower-",
+                "aws-service-role",
+            )
+            if name.startswith(name_prefixes):
+                raise Exception("Refusing to remediate protected role: " + name)
+            return {"RoleName": name}
+
+  # --- Read everything we need for a complete snapshot (read-only). ---
+  - name: getRoleDetails
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            role = boto3.client("iam").get_role(RoleName=events["RoleName"])["Role"]
+            return {"RoleJson": json.dumps(role, default=str)}
+    outputs:
+      - Name: RoleJson
+        Selector: $.Payload.RoleJson
+        Type: String
+
+  - name: listAttachedManagedPolicies
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            policies = []
+            for page in iam.get_paginator("list_attached_role_policies").paginate(
+                RoleName=events["RoleName"]
+            ):
+                policies.extend(page.get("AttachedPolicies", []))
+            return {"AttachedJson": json.dumps(policies)}
+    outputs:
+      - Name: AttachedJson
+        Selector: $.Payload.AttachedJson
+        Type: String
+
+  - name: listInlinePolicies
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            names = []
+            for page in iam.get_paginator("list_role_policies").paginate(
+                RoleName=events["RoleName"]
+            ):
+                names.extend(page.get("PolicyNames", []))
+            return {"InlineNamesJson": json.dumps(names)}
+    outputs:
+      - Name: InlineNamesJson
+        Selector: $.Payload.InlineNamesJson
+        Type: String
+
+  - name: getEachInlinePolicy
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+        InlineNamesJson: "{{ listInlinePolicies.InlineNamesJson }}"
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            documents = {}
+            for name in json.loads(events["InlineNamesJson"]):
+                documents[name] = iam.get_role_policy(
+                    RoleName=events["RoleName"], PolicyName=name
+                )["PolicyDocument"]
+            return {"InlinePoliciesJson": json.dumps(documents, default=str)}
+    outputs:
+      - Name: InlinePoliciesJson
+        Selector: $.Payload.InlinePoliciesJson
+        Type: String
+
+  - name: listInstanceProfilesForRole
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            names = []
+            for page in iam.get_paginator("list_instance_profiles_for_role").paginate(
+                RoleName=events["RoleName"]
+            ):
+                names.extend(ip["InstanceProfileName"] for ip in page.get("InstanceProfiles", []))
+            return {"InstanceProfilesJson": json.dumps(names)}
+    outputs:
+      - Name: InstanceProfilesJson
+        Selector: $.Payload.InstanceProfilesJson
+        Type: String
+
+  - name: buildSnapshot
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+        RoleJson: "{{ getRoleDetails.RoleJson }}"
+        AttachedJson: "{{ listAttachedManagedPolicies.AttachedJson }}"
+        InlinePoliciesJson: "{{ getEachInlinePolicy.InlinePoliciesJson }}"
+        InstanceProfilesJson: "{{ listInstanceProfilesForRole.InstanceProfilesJson }}"
+        FindingPk: "{{ FindingPk }}"
+        FindingSk: "{{ FindingSk }}"
+      Script: |
+        import json, datetime
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            snapshot = {
+                "role": json.loads(events["RoleJson"]),
+                "attached_managed_policies": json.loads(events["AttachedJson"]),
+                "inline_policies": json.loads(events["InlinePoliciesJson"]),
+                "instance_profiles": json.loads(events["InstanceProfilesJson"]),
+                "snapshot_metadata": {
+                    "snapshot_at": now.isoformat(),
+                    "taken_by": "TidewaterDeleteIamRole",
+                    "finding_pk": events["FindingPk"],
+                    "finding_sk": events["FindingSk"],
+                },
+            }
+            key = "iam/role/" + events["RoleName"] + "/" + now.strftime("%Y%m%dT%H%M%SZ") + ".json"
+            return {"SnapshotJson": json.dumps(snapshot, default=str), "SnapshotKey": key}
+    outputs:
+      - Name: SnapshotJson
+        Selector: $.Payload.SnapshotJson
+        Type: String
+      - Name: SnapshotKey
+        Selector: $.Payload.SnapshotKey
+        Type: String
+
+  # --- THE GATE: snapshot must land in S3 before anything is deleted. ---
+  # If this step fails the automation aborts (default onFailure: Abort) and no
+  # deletion step below runs.
+  - name: writeSnapshotToS3
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Bucket: "{{ SnapshotBucket }}"
+        Key: "{{ buildSnapshot.SnapshotKey }}"
+        Body: "{{ buildSnapshot.SnapshotJson }}"
+      Script: |
+        import boto3
+        def handler(events, context):
+            boto3.client("s3").put_object(
+                Bucket=events["Bucket"],
+                Key=events["Key"],
+                Body=events["Body"].encode(),
+                ContentType="application/json",
+            )
+            return {"SnapshotKey": events["Key"]}
+    outputs:
+      - Name: SnapshotKey
+        Selector: $.Payload.SnapshotKey
+        Type: String
+
+  # --- Detach/remove dependencies, then delete (all AFTER the snapshot). ---
+  - name: detachManagedPolicies
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+        AttachedJson: "{{ listAttachedManagedPolicies.AttachedJson }}"
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            for policy in json.loads(events["AttachedJson"]):
+                iam.detach_role_policy(RoleName=events["RoleName"], PolicyArn=policy["PolicyArn"])
+            return {}
+
+  - name: deleteInlinePolicies
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+        InlineNamesJson: "{{ listInlinePolicies.InlineNamesJson }}"
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            for name in json.loads(events["InlineNamesJson"]):
+                iam.delete_role_policy(RoleName=events["RoleName"], PolicyName=name)
+            return {}
+
+  - name: removeFromInstanceProfiles
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+        InstanceProfilesJson: "{{ listInstanceProfilesForRole.InstanceProfilesJson }}"
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            for name in json.loads(events["InstanceProfilesJson"]):
+                iam.remove_role_from_instance_profile(
+                    InstanceProfileName=name, RoleName=events["RoleName"]
+                )
+            return {}
+
+  - name: deleteRole
+    action: aws:executeAwsApi
+    inputs:
+      Service: iam
+      Api: DeleteRole
+      RoleName: "{{ RoleName }}"
+
+  - name: updateFindingResolved
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        TableName: "{{ FindingsTableName }}"
+        Pk: "{{ FindingPk }}"
+        Sk: "{{ FindingSk }}"
+        SnapshotKey: "{{ buildSnapshot.SnapshotKey }}"
+      Script: |
+        import boto3, datetime
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            boto3.client("dynamodb").update_item(
+                TableName=events["TableName"],
+                Key={"pk": {"S": events["Pk"]}, "sk": {"S": events["Sk"]}},
+                UpdateExpression="SET #s = :s, resolved_at = :r, snapshot_s3_key = :k",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":s": {"S": "resolved"},
+                    ":r": {"S": now},
+                    ":k": {"S": events["SnapshotKey"]},
+                },
+            )
+            return {}
+
+  - name: emitRemediationCompletedEvent
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        EventBusName: "{{ EventBusName }}"
+        RoleName: "{{ RoleName }}"
+        FindingPk: "{{ FindingPk }}"
+        FindingSk: "{{ FindingSk }}"
+        SnapshotKey: "{{ buildSnapshot.SnapshotKey }}"
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            boto3.client("events").put_events(Entries=[{
+                "Source": "tidewater.ssm_automation",
+                "DetailType": "finding.remediated",
+                "EventBusName": events["EventBusName"],
+                "Detail": json.dumps({
+                    "finding_pk": events["FindingPk"],
+                    "finding_sk": events["FindingSk"],
+                    "role_name": events["RoleName"],
+                    "snapshot_s3_key": events["SnapshotKey"],
+                }),
+            }])
+            return {}
+
+  - name: writeFinalAuditLog
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        AuditBucket: "{{ AuditBucket }}"
+        RoleName: "{{ RoleName }}"
+        FindingPk: "{{ FindingPk }}"
+        FindingSk: "{{ FindingSk }}"
+        SnapshotKey: "{{ buildSnapshot.SnapshotKey }}"
+      Script: |
+        import boto3, json, datetime, random
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            audit_id = format(int(now.timestamp() * 1000), "x") + format(random.getrandbits(40), "010x")
+            record = {
+                "audit_id": audit_id,
+                "timestamp": now.isoformat(),
+                "event_type": "remediation_completed",
+                "finding_pk": events["FindingPk"],
+                "finding_sk": events["FindingSk"],
+                "rule_id": "iam.unused_role",
+                "actor": "ssm_automation",
+                "details": {"role_name": events["RoleName"]},
+                "snapshot_s3_key": events["SnapshotKey"],
+            }
+            key = "audit/" + now.strftime("%Y/%m/%d/%H") + "/" + audit_id + ".jsonl"
+            boto3.client("s3").put_object(
+                Bucket=events["AuditBucket"], Key=key, Body=(json.dumps(record) + "\n").encode()
+            )
+            return {"AuditKey": key}

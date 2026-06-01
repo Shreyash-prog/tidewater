@@ -1,0 +1,4 @@
+# Runtime deps bundled into the remediator Lambda (ARM64 wheels).
+# Powertools = layer, boto3 = runtime.
+pydantic==2.13.4
+PyYAML==6.0.3
