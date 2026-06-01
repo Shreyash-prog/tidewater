@@ -102,7 +102,7 @@ def test_detector_flags_unused_role(aws_env: dict[str, str]) -> None:
         iam.create_role(
             RoleName=role_name,
             AssumeRolePolicyDocument=json.dumps(trust),
-            Description="Tidewater smoke test — safe to delete.",
+            Description="Tidewater smoke test - safe to delete.",
         )
 
         payload = {
