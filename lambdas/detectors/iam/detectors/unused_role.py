@@ -66,11 +66,19 @@ class UnusedRoleDetector(Detector):
                 if self._is_aws_managed(role):
                     continue
                 detail = self.iam.get_role(RoleName=role["RoleName"])["Role"]
-                finding = self._evaluate(detail, idle_days=idle_days, now=now)
+                tags = self._role_tags(role["RoleName"])
+                finding = self._evaluate(detail, idle_days=idle_days, now=now, tags=tags)
                 if finding is not None:
                     yield finding
 
-    def _evaluate(self, role: dict[str, Any], *, idle_days: int, now: datetime) -> Finding | None:
+    def _role_tags(self, role_name: str) -> dict[str, str]:
+        # Tags drive tag-based policy decisions (policy engine, Phase 4).
+        resp = self.iam.list_role_tags(RoleName=role_name)
+        return {tag["Key"]: tag["Value"] for tag in resp.get("Tags", [])}
+
+    def _evaluate(
+        self, role: dict[str, Any], *, idle_days: int, now: datetime, tags: dict[str, str]
+    ) -> Finding | None:
         create_date = _aware(role["CreateDate"])
         last_used_raw = (role.get("RoleLastUsed") or {}).get("LastUsedDate")
 
@@ -95,6 +103,7 @@ class UnusedRoleDetector(Detector):
             "last_used_date": last_used_iso,
             "days_idle": days_idle,
             "threshold_idle_days": idle_days,
+            "tags": tags,
         }
         return Finding(
             account=self.account,

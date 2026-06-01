@@ -26,8 +26,11 @@ def _ago(days: float) -> datetime:
     return datetime.now(UTC) - timedelta(days=days)
 
 
-def _make_role(client: Any, name: str, path: str = "/") -> None:
-    client.create_role(RoleName=name, Path=path, AssumeRolePolicyDocument=TRUST_DOC)
+def _make_role(client: Any, name: str, path: str = "/", tags: dict[str, str] | None = None) -> None:
+    kwargs: dict[str, Any] = {"RoleName": name, "Path": path, "AssumeRolePolicyDocument": TRUST_DOC}
+    if tags:
+        kwargs["Tags"] = [{"Key": k, "Value": v} for k, v in tags.items()]
+    client.create_role(**kwargs)
 
 
 def _fake_get_role(specs: dict[str, dict[str, Any]]) -> Any:
@@ -159,7 +162,20 @@ def test_details_payload_excludes_trust_policy() -> None:
         "last_used_date",
         "days_idle",
         "threshold_idle_days",
+        "tags",
     }
     # Trust policy must never leak into details.
     assert "AssumeRolePolicyDocument" not in finding.details
     assert finding.resource_arn == f"arn:aws:iam::{ACCOUNT}:role/detailed"
+
+
+@mock_aws
+def test_includes_role_tags_in_details() -> None:
+    client: Any = boto3.client("iam", region_name=REGION)
+    _make_role(client, "tagged", tags={"Environment": "nonprod", "team": "platform"})
+    client.get_role = _fake_get_role({"tagged": {"create_days": 60, "last_used_days": None}})
+
+    finding = next(iter(_detector(client).scan()))
+
+    # Tags drive tag-based policy decisions in the policy engine.
+    assert finding.details["tags"] == {"Environment": "nonprod", "team": "platform"}
