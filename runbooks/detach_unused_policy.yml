@@ -1,0 +1,182 @@
+schemaVersion: "0.3"
+description: >-
+  Tidewater: detach the least-recently-used managed policy from a role that is at
+  or near the 10-policy limit, after snapshotting the role + all attachments.
+  Deterministic tie-break by ARN when last-accessed data is unavailable/equal.
+  Snapshot is written before the detach.
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  RoleName: { type: String, description: Role to detach a policy from. }
+  SnapshotBucket: { type: String, description: S3 bucket for the snapshot. }
+  AuditBucket: { type: String, description: S3 bucket for the audit trail. }
+  FindingsTableName: { type: String, description: DynamoDB findings table. }
+  FindingPk: { type: String, description: Finding partition key. }
+  FindingSk: { type: String, description: Finding sort key. }
+  EventBusName: { type: String, description: EventBridge bus. }
+  AutomationAssumeRole: { type: String, description: Role this automation assumes. }
+mainSteps:
+  - name: assertRoleNotProtected
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { RoleName: "{{ RoleName }}" }
+      Script: |
+        def handler(events, context):
+            name = events["RoleName"]
+            protected = ("AWSReservedSSO_", "cdk-hnb659fds-", "StackSet-", "OrganizationAccountAccessRole", "aws-controltower-", "aws-service-role")
+            if name.startswith(protected):
+                raise Exception("Refusing to modify protected role: " + name)
+            return {"RoleName": name}
+
+  - name: getRoleAndAttachedPolicies
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { RoleName: "{{ RoleName }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            role = iam.get_role(RoleName=events["RoleName"])["Role"]
+            attached = []
+            for page in iam.get_paginator("list_attached_role_policies").paginate(RoleName=events["RoleName"]):
+                attached.extend(page.get("AttachedPolicies", []))
+            return {"RoleJson": json.dumps(role, default=str), "AttachedJson": json.dumps(attached)}
+    outputs:
+      - { Name: RoleJson, Selector: $.Payload.RoleJson, Type: String }
+      - { Name: AttachedJson, Selector: $.Payload.AttachedJson, Type: String }
+
+  - name: determineLeastRecentlyUsedPolicy
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { RoleJson: "{{ getRoleAndAttachedPolicies.RoleJson }}", AttachedJson: "{{ getRoleAndAttachedPolicies.AttachedJson }}" }
+      Script: |
+        import boto3, json, time
+        def handler(events, context):
+            iam = boto3.client("iam")
+            role_arn = json.loads(events["RoleJson"])["Arn"]
+            attached = json.loads(events["AttachedJson"])
+            if not attached:
+                raise Exception("Role has no attached policies to detach")
+            # Best-effort last-accessed per policy; fall back to deterministic ARN order.
+            scored = []
+            for policy in attached:
+                arn = policy["PolicyArn"]
+                last = "0000"
+                try:
+                    job = iam.generate_service_last_accessed_details(Arn=arn)["JobId"]
+                    for _ in range(3):
+                        resp = iam.get_service_last_accessed_details(JobId=job)
+                        if resp.get("JobStatus") == "COMPLETED":
+                            dates = [s["LastAuthenticated"].isoformat() for s in resp.get("ServicesLastAccessed", []) if s.get("LastAuthenticated")]
+                            last = max(dates) if dates else "0000"
+                            break
+                        time.sleep(1)
+                except Exception:
+                    last = "0000"
+                scored.append((last, arn))
+            scored.sort(key=lambda x: (x[0], x[1]))  # oldest first; ARN tie-break
+            return {"ChosenPolicyArn": scored[0][1]}
+    outputs:
+      - { Name: ChosenPolicyArn, Selector: $.Payload.ChosenPolicyArn, Type: String }
+
+  - name: buildSnapshot
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+        RoleJson: "{{ getRoleAndAttachedPolicies.RoleJson }}"
+        AttachedJson: "{{ getRoleAndAttachedPolicies.AttachedJson }}"
+        ChosenPolicyArn: "{{ determineLeastRecentlyUsedPolicy.ChosenPolicyArn }}"
+        FindingPk: "{{ FindingPk }}"
+        FindingSk: "{{ FindingSk }}"
+      Script: |
+        import json, datetime
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            snapshot = {
+                "role": json.loads(events["RoleJson"]),
+                "attached_policies": json.loads(events["AttachedJson"]),
+                "detaching": events["ChosenPolicyArn"],
+                "reason": "least-recently-used (ARN tie-break)",
+                "snapshot_metadata": {"snapshot_at": now.isoformat(), "taken_by": "TidewaterDetachUnusedPolicy", "finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"]},
+            }
+            key = "iam/policy_quota/" + events["RoleName"] + "/" + now.strftime("%Y%m%dT%H%M%SZ") + ".json"
+            return {"SnapshotJson": json.dumps(snapshot, default=str), "SnapshotKey": key}
+    outputs:
+      - { Name: SnapshotJson, Selector: $.Payload.SnapshotJson, Type: String }
+      - { Name: SnapshotKey, Selector: $.Payload.SnapshotKey, Type: String }
+
+  - name: writeSnapshotToS3
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { Bucket: "{{ SnapshotBucket }}", Key: "{{ buildSnapshot.SnapshotKey }}", Body: "{{ buildSnapshot.SnapshotJson }}" }
+      Script: |
+        import boto3
+        def handler(events, context):
+            boto3.client("s3").put_object(Bucket=events["Bucket"], Key=events["Key"], Body=events["Body"].encode(), ContentType="application/json")
+            return {"SnapshotKey": events["Key"]}
+    outputs:
+      - { Name: SnapshotKey, Selector: $.Payload.SnapshotKey, Type: String }
+
+  - name: detachPolicy
+    action: aws:executeAwsApi
+    inputs:
+      Service: iam
+      Api: DetachRolePolicy
+      RoleName: "{{ RoleName }}"
+      PolicyArn: "{{ determineLeastRecentlyUsedPolicy.ChosenPolicyArn }}"
+
+  - name: updateFindingResolved
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { TableName: "{{ FindingsTableName }}", Pk: "{{ FindingPk }}", Sk: "{{ FindingSk }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, datetime
+        def handler(events, context):
+            boto3.client("dynamodb").update_item(
+                TableName=events["TableName"],
+                Key={"pk": {"S": events["Pk"]}, "sk": {"S": events["Sk"]}},
+                UpdateExpression="SET #s = :s, resolved_at = :r, snapshot_s3_key = :k",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": {"S": "resolved"}, ":r": {"S": datetime.datetime.now(datetime.timezone.utc).isoformat()}, ":k": {"S": events["SnapshotKey"]}},
+            )
+            return {}
+
+  - name: emitRemediationCompletedEvent
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { EventBusName: "{{ EventBusName }}", RoleName: "{{ RoleName }}", ChosenPolicyArn: "{{ determineLeastRecentlyUsedPolicy.ChosenPolicyArn }}", FindingPk: "{{ FindingPk }}", FindingSk: "{{ FindingSk }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            boto3.client("events").put_events(Entries=[{"Source": "tidewater.ssm_automation", "DetailType": "finding.remediated", "EventBusName": events["EventBusName"], "Detail": json.dumps({"finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"], "role_name": events["RoleName"], "detached_policy_arn": events["ChosenPolicyArn"], "snapshot_s3_key": events["SnapshotKey"]})}])
+            return {}
+
+  - name: writeFinalAuditLog
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { AuditBucket: "{{ AuditBucket }}", RoleName: "{{ RoleName }}", FindingPk: "{{ FindingPk }}", FindingSk: "{{ FindingSk }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, json, datetime, os
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            audit_id = format(int(now.timestamp() * 1000), "x") + os.urandom(5).hex()
+            record = {"audit_id": audit_id, "timestamp": now.isoformat(), "event_type": "remediation_completed", "finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"], "rule_id": "iam.policy_quota", "actor": "ssm_automation", "details": {"role_name": events["RoleName"]}, "snapshot_s3_key": events["SnapshotKey"]}
+            key = "audit/" + now.strftime("%Y/%m/%d/%H") + "/" + audit_id + ".jsonl"
+            boto3.client("s3").put_object(Bucket=events["AuditBucket"], Key=key, Body=(json.dumps(record) + "\n").encode())
+            return {"AuditKey": key}

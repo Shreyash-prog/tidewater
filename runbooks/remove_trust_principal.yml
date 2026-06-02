@@ -1,0 +1,171 @@
+schemaVersion: "0.3"
+description: >-
+  Tidewater: remove orphaned trust principals from a role's assume-role policy
+  after snapshotting the full role + current trust document. Aborts (no mutation)
+  if removing the orphans would leave the role with no principal, or if the role
+  matches an AWS-managed pattern.
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  RoleName: { type: String, description: Role to update. }
+  OrphanPrincipals: { type: StringList, description: Principal ARNs to remove. }
+  SnapshotBucket: { type: String, description: S3 bucket for the snapshot. }
+  AuditBucket: { type: String, description: S3 bucket for the audit trail. }
+  FindingsTableName: { type: String, description: DynamoDB findings table. }
+  FindingPk: { type: String, description: Finding partition key. }
+  FindingSk: { type: String, description: Finding sort key. }
+  EventBusName: { type: String, description: EventBridge bus. }
+  AutomationAssumeRole: { type: String, description: Role this automation assumes. }
+mainSteps:
+  - name: assertRoleNotProtected
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { RoleName: "{{ RoleName }}" }
+      Script: |
+        def handler(events, context):
+            name = events["RoleName"]
+            protected = ("AWSReservedSSO_", "cdk-hnb659fds-", "StackSet-", "OrganizationAccountAccessRole", "aws-controltower-", "aws-service-role")
+            if name.startswith(protected):
+                raise Exception("Refusing to modify protected role: " + name)
+            return {"RoleName": name}
+
+  - name: getRoleDetails
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { RoleName: "{{ RoleName }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            role = boto3.client("iam").get_role(RoleName=events["RoleName"])["Role"]
+            return {"RoleJson": json.dumps(role, default=str)}
+    outputs:
+      - { Name: RoleJson, Selector: $.Payload.RoleJson, Type: String }
+
+  - name: buildSnapshot
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        RoleName: "{{ RoleName }}"
+        RoleJson: "{{ getRoleDetails.RoleJson }}"
+        OrphanPrincipals: "{{ OrphanPrincipals }}"
+        FindingPk: "{{ FindingPk }}"
+        FindingSk: "{{ FindingSk }}"
+      Script: |
+        import json, datetime
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            role = json.loads(events["RoleJson"])
+            snapshot = {
+                "role": role,
+                "current_trust_policy": role.get("AssumeRolePolicyDocument", {}),
+                "orphan_principals_removed": events["OrphanPrincipals"],
+                "snapshot_metadata": {"snapshot_at": now.isoformat(), "taken_by": "TidewaterRemoveTrustPrincipal", "finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"]},
+            }
+            key = "iam/trust/" + events["RoleName"] + "/" + now.strftime("%Y%m%dT%H%M%SZ") + ".json"
+            return {"SnapshotJson": json.dumps(snapshot, default=str), "SnapshotKey": key}
+    outputs:
+      - { Name: SnapshotJson, Selector: $.Payload.SnapshotJson, Type: String }
+      - { Name: SnapshotKey, Selector: $.Payload.SnapshotKey, Type: String }
+
+  - name: writeSnapshotToS3
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { Bucket: "{{ SnapshotBucket }}", Key: "{{ buildSnapshot.SnapshotKey }}", Body: "{{ buildSnapshot.SnapshotJson }}" }
+      Script: |
+        import boto3
+        def handler(events, context):
+            boto3.client("s3").put_object(Bucket=events["Bucket"], Key=events["Key"], Body=events["Body"].encode(), ContentType="application/json")
+            return {"SnapshotKey": events["Key"]}
+    outputs:
+      - { Name: SnapshotKey, Selector: $.Payload.SnapshotKey, Type: String }
+
+  - name: computeNewTrustPolicy
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { RoleJson: "{{ getRoleDetails.RoleJson }}", OrphanPrincipals: "{{ OrphanPrincipals }}" }
+      Script: |
+        import json
+        def handler(events, context):
+            role = json.loads(events["RoleJson"])
+            orphans = set(events["OrphanPrincipals"])
+            document = role.get("AssumeRolePolicyDocument", {})
+            remaining = 0
+            for statement in document.get("Statement", []):
+                principal = statement.get("Principal", {})
+                aws = principal.get("AWS")
+                if aws is not None:
+                    aws_list = aws if isinstance(aws, list) else [aws]
+                    kept = [p for p in aws_list if p not in orphans]
+                    if kept:
+                        principal["AWS"] = kept if len(kept) > 1 else kept[0]
+                    else:
+                        principal.pop("AWS", None)
+                remaining += len(principal)  # any remaining Service/AWS/Federated principals
+            if remaining == 0:
+                raise Exception("Removing orphan principals would leave the role unassumable; aborting")
+            return {"NewPolicyJson": json.dumps(document)}
+    outputs:
+      - { Name: NewPolicyJson, Selector: $.Payload.NewPolicyJson, Type: String }
+
+  - name: updateAssumeRolePolicy
+    action: aws:executeAwsApi
+    inputs:
+      Service: iam
+      Api: UpdateAssumeRolePolicy
+      RoleName: "{{ RoleName }}"
+      PolicyDocument: "{{ computeNewTrustPolicy.NewPolicyJson }}"
+
+  - name: updateFindingResolved
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { TableName: "{{ FindingsTableName }}", Pk: "{{ FindingPk }}", Sk: "{{ FindingSk }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, datetime
+        def handler(events, context):
+            boto3.client("dynamodb").update_item(
+                TableName=events["TableName"],
+                Key={"pk": {"S": events["Pk"]}, "sk": {"S": events["Sk"]}},
+                UpdateExpression="SET #s = :s, resolved_at = :r, snapshot_s3_key = :k",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": {"S": "resolved"}, ":r": {"S": datetime.datetime.now(datetime.timezone.utc).isoformat()}, ":k": {"S": events["SnapshotKey"]}},
+            )
+            return {}
+
+  - name: emitRemediationCompletedEvent
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { EventBusName: "{{ EventBusName }}", RoleName: "{{ RoleName }}", FindingPk: "{{ FindingPk }}", FindingSk: "{{ FindingSk }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            boto3.client("events").put_events(Entries=[{"Source": "tidewater.ssm_automation", "DetailType": "finding.remediated", "EventBusName": events["EventBusName"], "Detail": json.dumps({"finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"], "role_name": events["RoleName"], "snapshot_s3_key": events["SnapshotKey"]})}])
+            return {}
+
+  - name: writeFinalAuditLog
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { AuditBucket: "{{ AuditBucket }}", RoleName: "{{ RoleName }}", FindingPk: "{{ FindingPk }}", FindingSk: "{{ FindingSk }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, json, datetime, os
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            audit_id = format(int(now.timestamp() * 1000), "x") + os.urandom(5).hex()
+            record = {"audit_id": audit_id, "timestamp": now.isoformat(), "event_type": "remediation_completed", "finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"], "rule_id": "iam.orphaned_trust", "actor": "ssm_automation", "details": {"role_name": events["RoleName"]}, "snapshot_s3_key": events["SnapshotKey"]}
+            key = "audit/" + now.strftime("%Y/%m/%d/%H") + "/" + audit_id + ".jsonl"
+            boto3.client("s3").put_object(Bucket=events["AuditBucket"], Key=key, Body=(json.dumps(record) + "\n").encode())
+            return {"AuditKey": key}
