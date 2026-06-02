@@ -11,6 +11,7 @@ invoked with one.
 """
 
 import os
+from collections.abc import Callable
 from typing import Any
 
 import boto3
@@ -29,9 +30,57 @@ metrics = Metrics()
 SOURCE = "tidewater.remediator"
 ACTOR = "remediator"
 
-# rule_id -> SSM Automation document name. Grows in Phase 5.
+# rule_id -> SSM Automation document name.
+# NOTE: iam.wildcard_policy is intentionally absent — it is flag-only and must
+# never be auto-remediated (CLAUDE.md). The policy engine never routes it here,
+# and even if it did, REGISTRY.get() returns None → "no_runbook".
 REGISTRY: dict[str, str] = {
     "iam.unused_role": "TidewaterDeleteIamRole",
+    "iam.stale_access_key": "TidewaterDeleteIamAccessKey",
+    "iam.orphaned_trust": "TidewaterRemoveTrustPrincipal",
+    "iam.unused_policy": "TidewaterDeleteUnusedPolicy",
+    "iam.policy_quota": "TidewaterDetachUnusedPolicy",
+}
+
+
+# Per-rule builders for the runbook-specific SSM parameters. Common parameters
+# (snapshot/audit buckets, findings table, finding keys, bus, assume-role) are
+# added centrally in the handler. Each builder reads the finding's `details`,
+# which the detector populated.
+def _params_unused_role(item: dict[str, Any]) -> dict[str, list[str]]:
+    return {"RoleName": [role_name_from_arn(str(item["resource_arn"]))]}
+
+
+def _params_stale_access_key(item: dict[str, Any]) -> dict[str, list[str]]:
+    details = item.get("details", {})
+    return {
+        "AccessKeyId": [str(details["access_key_id"])],
+        "UserName": [str(details["user_name"])],
+    }
+
+
+def _params_orphaned_trust(item: dict[str, Any]) -> dict[str, list[str]]:
+    details = item.get("details", {})
+    return {
+        "RoleName": [str(details["role_name"])],
+        "OrphanPrincipals": [str(p) for p in details["orphan_principals"]],
+    }
+
+
+def _params_unused_policy(item: dict[str, Any]) -> dict[str, list[str]]:
+    return {"PolicyArn": [str(item.get("details", {})["policy_arn"])]}
+
+
+def _params_detach_unused_policy(item: dict[str, Any]) -> dict[str, list[str]]:
+    return {"RoleName": [str(item.get("details", {})["role_name"])]}
+
+
+PARAM_BUILDERS: dict[str, Callable[[dict[str, Any]], dict[str, list[str]]]] = {
+    "iam.unused_role": _params_unused_role,
+    "iam.stale_access_key": _params_stale_access_key,
+    "iam.orphaned_trust": _params_orphaned_trust,
+    "iam.unused_policy": _params_unused_policy,
+    "iam.policy_quota": _params_detach_unused_policy,
 }
 
 
@@ -100,22 +149,24 @@ def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, Any]:
         )
         return {"status": "refused_protected", "resource_arn": resource_arn}
 
-    role_name = role_name_from_arn(resource_arn)
+    build_params = PARAM_BUILDERS.get(rule_id)
+    if build_params is None:
+        logger.error("no parameter builder for rule_id; skipping", extra={"rule_id": rule_id})
+        return {"status": "no_runbook", "rule_id": rule_id}
+
     _set_status(pk, sk, FindingStatus.IN_REMEDIATION)
 
-    execution_id = _start_automation(
-        document_name,
-        {
-            "RoleName": [role_name],
-            "SnapshotBucket": [os.environ["SNAPSHOT_BUCKET"]],
-            "AuditBucket": [os.environ["AUDIT_BUCKET"]],
-            "FindingsTableName": [os.environ["FINDINGS_TABLE"]],
-            "FindingPk": [pk],
-            "FindingSk": [sk],
-            "EventBusName": [os.environ["EVENT_BUS_NAME"]],
-            "AutomationAssumeRole": [os.environ["SSM_EXECUTION_ROLE_ARN"]],
-        },
-    )
+    parameters: dict[str, list[str]] = {
+        **build_params(item),
+        "SnapshotBucket": [os.environ["SNAPSHOT_BUCKET"]],
+        "AuditBucket": [os.environ["AUDIT_BUCKET"]],
+        "FindingsTableName": [os.environ["FINDINGS_TABLE"]],
+        "FindingPk": [pk],
+        "FindingSk": [sk],
+        "EventBusName": [os.environ["EVENT_BUS_NAME"]],
+        "AutomationAssumeRole": [os.environ["SSM_EXECUTION_ROLE_ARN"]],
+    }
+    execution_id = _start_automation(document_name, parameters)
 
     write_audit_event(
         event_type="remediation_started",
@@ -137,5 +188,8 @@ def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, Any]:
         },
         source=SOURCE,
     )
-    logger.info("remediation started", extra={"execution_id": execution_id, "role_name": role_name})
+    logger.info(
+        "remediation started",
+        extra={"execution_id": execution_id, "rule_id": rule_id, "document_name": document_name},
+    )
     return {"status": "started", "execution_id": execution_id}

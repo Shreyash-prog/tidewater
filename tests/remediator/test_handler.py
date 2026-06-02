@@ -66,7 +66,9 @@ def aws(monkeypatch: pytest.MonkeyPatch) -> Any:
         yield boto3.resource("dynamodb", region_name=REGION).Table(FINDINGS_TABLE)
 
 
-def _put_finding(table: Any, *, rule_id: str, resource_arn: str) -> str:
+def _put_finding(
+    table: Any, *, rule_id: str, resource_arn: str, details: dict[str, Any] | None = None
+) -> str:
     sk = f"{resource_arn}#{rule_id}"
     now = datetime.now(UTC).isoformat()
     table.put_item(
@@ -78,7 +80,7 @@ def _put_finding(table: Any, *, rule_id: str, resource_arn: str) -> str:
             "status": "open",
             "detected_at": now,
             "last_seen_at": now,
-            "details": {},
+            "details": details or {},
         }
     )
     return sk
@@ -103,6 +105,100 @@ def test_selects_correct_ssm_document_and_parameters(aws: Any) -> None:
     assert aws.get_item(Key={"pk": PK, "sk": sk})["Item"]["status"] == (
         FindingStatus.IN_REMEDIATION.value
     )
+
+
+def test_stale_access_key_builds_user_and_key_params(aws: Any) -> None:
+    arn = "arn:aws:iam::111:user/alice#accesskey/AKIAEXAMPLE"
+    sk = _put_finding(
+        aws,
+        rule_id="iam.stale_access_key",
+        resource_arn=arn,
+        details={"user_name": "alice", "access_key_id": "AKIAEXAMPLE"},
+    )
+
+    result = rm.handler({"finding_pk": PK, "finding_sk": sk}, _context())
+
+    assert result["status"] == "started"
+    ((args, _),) = rm._start_automation.calls
+    document_name, parameters = args
+    assert document_name == "TidewaterDeleteIamAccessKey"
+    assert parameters["UserName"] == ["alice"]
+    assert parameters["AccessKeyId"] == ["AKIAEXAMPLE"]
+    assert "RoleName" not in parameters
+
+
+def test_orphaned_trust_builds_role_and_principal_list(aws: Any) -> None:
+    arn = "arn:aws:iam::111:role/app-role"
+    sk = _put_finding(
+        aws,
+        rule_id="iam.orphaned_trust",
+        resource_arn=arn,
+        details={
+            "role_name": "app-role",
+            "orphan_principals": ["arn:aws:iam::111:role/gone", "arn:aws:iam::111:user/gone"],
+        },
+    )
+
+    result = rm.handler({"finding_pk": PK, "finding_sk": sk}, _context())
+
+    assert result["status"] == "started"
+    ((args, _),) = rm._start_automation.calls
+    document_name, parameters = args
+    assert document_name == "TidewaterRemoveTrustPrincipal"
+    assert parameters["RoleName"] == ["app-role"]
+    assert parameters["OrphanPrincipals"] == [
+        "arn:aws:iam::111:role/gone",
+        "arn:aws:iam::111:user/gone",
+    ]
+
+
+def test_unused_policy_builds_policy_arn_param(aws: Any) -> None:
+    arn = "arn:aws:iam::111:policy/dangling"
+    sk = _put_finding(
+        aws,
+        rule_id="iam.unused_policy",
+        resource_arn=arn,
+        details={"policy_arn": arn, "policy_name": "dangling"},
+    )
+
+    result = rm.handler({"finding_pk": PK, "finding_sk": sk}, _context())
+
+    assert result["status"] == "started"
+    ((args, _),) = rm._start_automation.calls
+    document_name, parameters = args
+    assert document_name == "TidewaterDeleteUnusedPolicy"
+    assert parameters["PolicyArn"] == [arn]
+
+
+def test_policy_quota_builds_role_name_param(aws: Any) -> None:
+    arn = "arn:aws:iam::111:role/overloaded"
+    sk = _put_finding(
+        aws,
+        rule_id="iam.policy_quota",
+        resource_arn=arn,
+        details={"role_name": "overloaded", "attached_count": 11},
+    )
+
+    result = rm.handler({"finding_pk": PK, "finding_sk": sk}, _context())
+
+    assert result["status"] == "started"
+    ((args, _),) = rm._start_automation.calls
+    document_name, parameters = args
+    assert document_name == "TidewaterDetachUnusedPolicy"
+    assert parameters["RoleName"] == ["overloaded"]
+
+
+def test_wildcard_policy_is_never_remediated(aws: Any) -> None:
+    # Flag-only rule: even if a finding somehow reaches the remediator, there is
+    # no runbook and SSM is never started.
+    arn = "arn:aws:iam::111:policy/wild"
+    sk = _put_finding(aws, rule_id="iam.wildcard_policy", resource_arn=arn)
+
+    result = rm.handler({"finding_pk": PK, "finding_sk": sk}, _context())
+
+    assert result["status"] == "no_runbook"
+    assert rm._start_automation.calls == []
+    assert aws.get_item(Key={"pk": PK, "sk": sk})["Item"]["status"] == "open"
 
 
 def test_unknown_rule_id_exits_cleanly(aws: Any) -> None:
