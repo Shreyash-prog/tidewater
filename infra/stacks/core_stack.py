@@ -683,9 +683,16 @@ class CoreStack(Stack):
             },
         )
         # Phase 5: seed one rules_meta row per new rule (same Custom Resource).
+        # These are created in series via explicit CloudFormation DependsOn edges:
+        # CFN otherwise invokes the single backing provider Lambda once per rule
+        # concurrently, tripping AWS Lambda's control-plane Invoke rate limit
+        # (TooManyRequestsException: Rate Exceeded). Serializing keeps at most one
+        # provider invocation in flight at a time. This is orchestration-level
+        # throttling, not a Lambda-side retry concern.
+        rules_meta_resources: list[CustomResource] = []
         for rule_id in PHASE5_RULES:
             construct_id = "RulesMeta" + "".join(part.title() for part in rule_id.split("."))
-            CustomResource(
+            resource = CustomResource(
                 self,
                 construct_id,
                 service_token=seed_provider.service_token,
@@ -699,6 +706,10 @@ class CoreStack(Stack):
                     "Schedule": "on-demand",
                 },
             )
+            if rules_meta_resources:
+                # Each depends on the previous so CFN processes them one at a time.
+                resource.node.add_dependency(rules_meta_resources[-1])
+            rules_meta_resources.append(resource)
 
         return fn.function_name
 
