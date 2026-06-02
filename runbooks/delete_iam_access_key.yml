@@ -1,0 +1,171 @@
+schemaVersion: "0.3"
+description: >-
+  Tidewater: DEACTIVATE a stale IAM access key after snapshotting the user + key
+  metadata to S3. This runbook only sets Status=Inactive (reversible). It does NOT
+  delete the key: deletion is irreversible and the secret can't be snapshotted, so
+  full deletion is a separate operator-triggered action, never automatic.
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  AccessKeyId: { type: String, description: Access key to deactivate. }
+  UserName: { type: String, description: Owning IAM user. }
+  SnapshotBucket: { type: String, description: S3 bucket for the snapshot. }
+  AuditBucket: { type: String, description: S3 bucket for the JSONL audit trail. }
+  FindingsTableName: { type: String, description: DynamoDB findings table. }
+  FindingPk: { type: String, description: Finding partition key. }
+  FindingSk: { type: String, description: Finding sort key. }
+  EventBusName: { type: String, description: EventBridge bus. }
+  AutomationAssumeRole: { type: String, description: Role this automation assumes. }
+mainSteps:
+  - name: getUserAndKey
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { UserName: "{{ UserName }}", AccessKeyId: "{{ AccessKeyId }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            user = iam.get_user(UserName=events["UserName"])["User"]
+            last = iam.get_access_key_last_used(AccessKeyId=events["AccessKeyId"]).get("AccessKeyLastUsed", {})
+            return {"UserJson": json.dumps(user, default=str), "KeyLastUsedJson": json.dumps(last, default=str)}
+    outputs:
+      - { Name: UserJson, Selector: $.Payload.UserJson, Type: String }
+      - { Name: KeyLastUsedJson, Selector: $.Payload.KeyLastUsedJson, Type: String }
+
+  - name: listAttachedUserPolicies
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { UserName: "{{ UserName }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            out = []
+            for page in iam.get_paginator("list_attached_user_policies").paginate(UserName=events["UserName"]):
+                out.extend(page.get("AttachedPolicies", []))
+            return {"AttachedJson": json.dumps(out)}
+    outputs:
+      - { Name: AttachedJson, Selector: $.Payload.AttachedJson, Type: String }
+
+  - name: listInlineUserPolicies
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { UserName: "{{ UserName }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            names = []
+            for page in iam.get_paginator("list_user_policies").paginate(UserName=events["UserName"]):
+                names.extend(page.get("PolicyNames", []))
+            return {"InlineNamesJson": json.dumps(names)}
+    outputs:
+      - { Name: InlineNamesJson, Selector: $.Payload.InlineNamesJson, Type: String }
+
+  - name: buildSnapshot
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        UserName: "{{ UserName }}"
+        AccessKeyId: "{{ AccessKeyId }}"
+        UserJson: "{{ getUserAndKey.UserJson }}"
+        KeyLastUsedJson: "{{ getUserAndKey.KeyLastUsedJson }}"
+        AttachedJson: "{{ listAttachedUserPolicies.AttachedJson }}"
+        InlineNamesJson: "{{ listInlineUserPolicies.InlineNamesJson }}"
+        FindingPk: "{{ FindingPk }}"
+        FindingSk: "{{ FindingSk }}"
+      Script: |
+        import json, datetime
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            snapshot = {
+                "user": json.loads(events["UserJson"]),
+                "access_key_id": events["AccessKeyId"],
+                "key_last_used": json.loads(events["KeyLastUsedJson"]),
+                "attached_user_policies": json.loads(events["AttachedJson"]),
+                "inline_user_policies": json.loads(events["InlineNamesJson"]),
+                "snapshot_metadata": {"snapshot_at": now.isoformat(), "taken_by": "TidewaterDeleteIamAccessKey", "finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"]},
+            }
+            key = "iam/access_key/" + events["UserName"] + "/" + events["AccessKeyId"] + "/" + now.strftime("%Y%m%dT%H%M%SZ") + ".json"
+            return {"SnapshotJson": json.dumps(snapshot, default=str), "SnapshotKey": key}
+    outputs:
+      - { Name: SnapshotJson, Selector: $.Payload.SnapshotJson, Type: String }
+      - { Name: SnapshotKey, Selector: $.Payload.SnapshotKey, Type: String }
+
+  # THE GATE: snapshot must land before the key is touched.
+  - name: writeSnapshotToS3
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { Bucket: "{{ SnapshotBucket }}", Key: "{{ buildSnapshot.SnapshotKey }}", Body: "{{ buildSnapshot.SnapshotJson }}" }
+      Script: |
+        import boto3
+        def handler(events, context):
+            boto3.client("s3").put_object(Bucket=events["Bucket"], Key=events["Key"], Body=events["Body"].encode(), ContentType="application/json")
+            return {"SnapshotKey": events["Key"]}
+    outputs:
+      - { Name: SnapshotKey, Selector: $.Payload.SnapshotKey, Type: String }
+
+  # Reversible: deactivate only. Deletion is operator-driven (see header).
+  - name: deactivateAccessKey
+    action: aws:executeAwsApi
+    inputs:
+      Service: iam
+      Api: UpdateAccessKey
+      UserName: "{{ UserName }}"
+      AccessKeyId: "{{ AccessKeyId }}"
+      Status: Inactive
+
+  - name: updateFindingResolved
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { TableName: "{{ FindingsTableName }}", Pk: "{{ FindingPk }}", Sk: "{{ FindingSk }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, datetime
+        def handler(events, context):
+            boto3.client("dynamodb").update_item(
+                TableName=events["TableName"],
+                Key={"pk": {"S": events["Pk"]}, "sk": {"S": events["Sk"]}},
+                UpdateExpression="SET #s = :s, resolved_at = :r, snapshot_s3_key = :k, resolution_note = :n",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": {"S": "resolved"}, ":r": {"S": datetime.datetime.now(datetime.timezone.utc).isoformat()}, ":k": {"S": events["SnapshotKey"]}, ":n": {"S": "deactivated; full deletion requires operator confirmation"}},
+            )
+            return {}
+
+  - name: emitRemediationCompletedEvent
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { EventBusName: "{{ EventBusName }}", UserName: "{{ UserName }}", AccessKeyId: "{{ AccessKeyId }}", FindingPk: "{{ FindingPk }}", FindingSk: "{{ FindingSk }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            boto3.client("events").put_events(Entries=[{"Source": "tidewater.ssm_automation", "DetailType": "finding.remediated", "EventBusName": events["EventBusName"], "Detail": json.dumps({"finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"], "user_name": events["UserName"], "access_key_id": events["AccessKeyId"], "action": "deactivated", "snapshot_s3_key": events["SnapshotKey"]})}])
+            return {}
+
+  - name: writeFinalAuditLog
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { AuditBucket: "{{ AuditBucket }}", FindingPk: "{{ FindingPk }}", FindingSk: "{{ FindingSk }}", AccessKeyId: "{{ AccessKeyId }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, json, datetime, os
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            audit_id = format(int(now.timestamp() * 1000), "x") + os.urandom(5).hex()
+            record = {"audit_id": audit_id, "timestamp": now.isoformat(), "event_type": "remediation_completed", "finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"], "rule_id": "iam.stale_access_key", "actor": "ssm_automation", "details": {"access_key_id": events["AccessKeyId"], "action": "deactivated"}, "snapshot_s3_key": events["SnapshotKey"]}
+            key = "audit/" + now.strftime("%Y/%m/%d/%H") + "/" + audit_id + ".jsonl"
+            boto3.client("s3").put_object(Bucket=events["AuditBucket"], Key=key, Body=(json.dumps(record) + "\n").encode())
+            return {"AuditKey": key}

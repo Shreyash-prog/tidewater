@@ -1,0 +1,191 @@
+schemaVersion: "0.3"
+description: >-
+  Tidewater: delete an unused customer-managed IAM policy after snapshotting all
+  its versions. Refuses AWS-managed policies and ABORTS if the policy has gained
+  any attachment since detection (fail safe). Snapshot is written before any
+  deletion step runs.
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  PolicyArn: { type: String, description: Customer-managed policy ARN to delete. }
+  SnapshotBucket: { type: String, description: S3 bucket for the snapshot. }
+  AuditBucket: { type: String, description: S3 bucket for the audit trail. }
+  FindingsTableName: { type: String, description: DynamoDB findings table. }
+  FindingPk: { type: String, description: Finding partition key. }
+  FindingSk: { type: String, description: Finding sort key. }
+  EventBusName: { type: String, description: EventBridge bus. }
+  AutomationAssumeRole: { type: String, description: Role this automation assumes. }
+mainSteps:
+  - name: assertPolicyNotProtected
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { PolicyArn: "{{ PolicyArn }}" }
+      Script: |
+        def handler(events, context):
+            if events["PolicyArn"].startswith("arn:aws:iam::aws:policy/"):
+                raise Exception("Refusing to delete AWS-managed policy: " + events["PolicyArn"])
+            return {"PolicyArn": events["PolicyArn"]}
+
+  - name: listPolicyVersions
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { PolicyArn: "{{ PolicyArn }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            versions = []
+            for page in boto3.client("iam").get_paginator("list_policy_versions").paginate(PolicyArn=events["PolicyArn"]):
+                versions.extend(page.get("Versions", []))
+            return {"VersionsJson": json.dumps(versions, default=str)}
+    outputs:
+      - { Name: VersionsJson, Selector: $.Payload.VersionsJson, Type: String }
+
+  - name: getEachPolicyVersion
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { PolicyArn: "{{ PolicyArn }}", VersionsJson: "{{ listPolicyVersions.VersionsJson }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            documents = {}
+            for v in json.loads(events["VersionsJson"]):
+                vid = v["VersionId"]
+                documents[vid] = iam.get_policy_version(PolicyArn=events["PolicyArn"], VersionId=vid)["PolicyVersion"]["Document"]
+            return {"DocumentsJson": json.dumps(documents, default=str)}
+    outputs:
+      - { Name: DocumentsJson, Selector: $.Payload.DocumentsJson, Type: String }
+
+  # Fail safe: the detector saw zero attachments, but re-check at execution time.
+  - name: assertNoAttachments
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { PolicyArn: "{{ PolicyArn }}" }
+      Script: |
+        import boto3
+        def handler(events, context):
+            iam = boto3.client("iam")
+            roles, users, groups = [], [], []
+            for page in iam.get_paginator("list_entities_for_policy").paginate(PolicyArn=events["PolicyArn"]):
+                roles += page.get("PolicyRoles", []); users += page.get("PolicyUsers", []); groups += page.get("PolicyGroups", [])
+            if roles or users or groups:
+                raise Exception("Policy has attachments; aborting deletion (state changed since detection)")
+            return {"attachments": 0}
+
+  - name: buildSnapshot
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        PolicyArn: "{{ PolicyArn }}"
+        VersionsJson: "{{ listPolicyVersions.VersionsJson }}"
+        DocumentsJson: "{{ getEachPolicyVersion.DocumentsJson }}"
+        FindingPk: "{{ FindingPk }}"
+        FindingSk: "{{ FindingSk }}"
+      Script: |
+        import json, datetime
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            policy_name = events["PolicyArn"].split("/")[-1]
+            snapshot = {
+                "policy_arn": events["PolicyArn"],
+                "versions": json.loads(events["VersionsJson"]),
+                "version_documents": json.loads(events["DocumentsJson"]),
+                "attachments": {"roles": [], "users": [], "groups": []},
+                "snapshot_metadata": {"snapshot_at": now.isoformat(), "taken_by": "TidewaterDeleteUnusedPolicy", "finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"]},
+            }
+            key = "iam/policy/" + policy_name + "/" + now.strftime("%Y%m%dT%H%M%SZ") + ".json"
+            return {"SnapshotJson": json.dumps(snapshot, default=str), "SnapshotKey": key}
+    outputs:
+      - { Name: SnapshotJson, Selector: $.Payload.SnapshotJson, Type: String }
+      - { Name: SnapshotKey, Selector: $.Payload.SnapshotKey, Type: String }
+
+  - name: writeSnapshotToS3
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { Bucket: "{{ SnapshotBucket }}", Key: "{{ buildSnapshot.SnapshotKey }}", Body: "{{ buildSnapshot.SnapshotJson }}" }
+      Script: |
+        import boto3
+        def handler(events, context):
+            boto3.client("s3").put_object(Bucket=events["Bucket"], Key=events["Key"], Body=events["Body"].encode(), ContentType="application/json")
+            return {"SnapshotKey": events["Key"]}
+    outputs:
+      - { Name: SnapshotKey, Selector: $.Payload.SnapshotKey, Type: String }
+
+  - name: deleteNonDefaultVersions
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { PolicyArn: "{{ PolicyArn }}", VersionsJson: "{{ listPolicyVersions.VersionsJson }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            iam = boto3.client("iam")
+            for v in json.loads(events["VersionsJson"]):
+                if not v.get("IsDefaultVersion"):
+                    iam.delete_policy_version(PolicyArn=events["PolicyArn"], VersionId=v["VersionId"])
+            return {}
+
+  - name: deletePolicy
+    action: aws:executeAwsApi
+    inputs:
+      Service: iam
+      Api: DeletePolicy
+      PolicyArn: "{{ PolicyArn }}"
+
+  - name: updateFindingResolved
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { TableName: "{{ FindingsTableName }}", Pk: "{{ FindingPk }}", Sk: "{{ FindingSk }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, datetime
+        def handler(events, context):
+            boto3.client("dynamodb").update_item(
+                TableName=events["TableName"],
+                Key={"pk": {"S": events["Pk"]}, "sk": {"S": events["Sk"]}},
+                UpdateExpression="SET #s = :s, resolved_at = :r, snapshot_s3_key = :k",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": {"S": "resolved"}, ":r": {"S": datetime.datetime.now(datetime.timezone.utc).isoformat()}, ":k": {"S": events["SnapshotKey"]}},
+            )
+            return {}
+
+  - name: emitRemediationCompletedEvent
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { EventBusName: "{{ EventBusName }}", PolicyArn: "{{ PolicyArn }}", FindingPk: "{{ FindingPk }}", FindingSk: "{{ FindingSk }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            boto3.client("events").put_events(Entries=[{"Source": "tidewater.ssm_automation", "DetailType": "finding.remediated", "EventBusName": events["EventBusName"], "Detail": json.dumps({"finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"], "policy_arn": events["PolicyArn"], "snapshot_s3_key": events["SnapshotKey"]})}])
+            return {}
+
+  - name: writeFinalAuditLog
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { AuditBucket: "{{ AuditBucket }}", PolicyArn: "{{ PolicyArn }}", FindingPk: "{{ FindingPk }}", FindingSk: "{{ FindingSk }}", SnapshotKey: "{{ buildSnapshot.SnapshotKey }}" }
+      Script: |
+        import boto3, json, datetime, os
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            audit_id = format(int(now.timestamp() * 1000), "x") + os.urandom(5).hex()
+            record = {"audit_id": audit_id, "timestamp": now.isoformat(), "event_type": "remediation_completed", "finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"], "rule_id": "iam.unused_policy", "actor": "ssm_automation", "details": {"policy_arn": events["PolicyArn"]}, "snapshot_s3_key": events["SnapshotKey"]}
+            key = "audit/" + now.strftime("%Y/%m/%d/%H") + "/" + audit_id + ".jsonl"
+            boto3.client("s3").put_object(Bucket=events["AuditBucket"], Key=key, Body=(json.dumps(record) + "\n").encode())
+            return {"AuditKey": key}

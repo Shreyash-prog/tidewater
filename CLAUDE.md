@@ -50,6 +50,19 @@ This is a POC of a platform hygiene framework for AWS. You are helping build it.
 - Phase 3 is **on-demand only** (no EventBridge Schedule) and hard-codes `policy_decision = dry_run`; the policy engine arrives in Phase 4.
 - ⚠️ **The shipped POC rule values are demo-only and unsafe in production.** `infra/initial_rules/iam.unused_role.yaml` uses `idle_days: -1` (flags any role idle ≥ 0 days, so the demo runs in seconds), `grace_period_days: 0` (no window before auto-remediation), and an `Environment=nonprod → auto` override. Production rules use `idle_days` of 7–90, `grace_period_days` ≥ 14, and `prompt` (human review) rather than `auto`. See README "POC vs Production".
 
+### IAM grants ↔ boto3 calls (Phase 5)
+
+- Detector execution-role permissions are **hand-curated** in `core_stack.py` (`_iam_detector`), not derived from a CDK `grant_*` helper. They can drift out of sync with detector code. `tests/test_iam_grants_match_boto3_calls.py` is a meta-test that statically scans detector source for boto3 IAM calls (direct, callable-reference, and `get_paginator("...")` forms) and asserts the synthesized role grants the matching action.
+- **Adding a new IAM API call to a detector requires two edits:** (1) grant the `iam:` action in `core_stack.py`, and (2) add the `boto3_method -> iam:Action` pair to `BOTO3_METHOD_TO_IAM_ACTION` in that test. The test fails loudly until both are present.
+- `iam.wildcard_policy` is **read-only by design and flag-only**: it has no SSM runbook, no `REGISTRY` entry in the remediator, and must never be auto-remediated under any circumstances. Wildcard policies frequently exist for legitimate reasons the framework can't see.
+
+### Remediation runbook authoring (Phase 5)
+
+- Each destructive rule maps to one SSM Automation document in `runbooks/` and one `REGISTRY` entry + parameter builder in `lambdas/remediator/handler.py`. The remediator only dispatches + audits; the runbook does the snapshot-then-mutate. `runbooks/_shared/snapshot_and_audit.py` is the unit-tested canonical reference for the snapshot/audit/finding-update/event helpers; the runbooks inline equivalent self-contained Python (SSM `aws:executeScript`) so they need no attachments.
+- **Every runbook snapshots before it mutates** (the `writeSnapshotToS3` gate) and re-asserts its guardrail (protected-role / AWS-managed-policy / no-attachments) at execution time. `tests/runbook/test_new_runbooks.py` enforces this ordering structurally.
+- `delete_iam_access_key.yml` **deactivates only** (`UpdateAccessKey Status=Inactive`) — it never calls `DeleteAccessKey`. Key deletion is irreversible and the secret can't be snapshotted, so full deletion is an operator-driven action, never automatic.
+- SSM-runbook IAM permissions live on `TidewaterSsmExecutionRole`, scoped by resource type (role/ vs user/ vs policy/); service-last-accessed APIs key off a JobId and can't be resource-scoped, so they're granted on `*`.
+
 ### Approval idempotency
 
 - **One approval per finding, ever.** Approval rows are keyed by a deterministic id — `appr_` + the first 24 hex chars of `sha256("{finding_pk}|{finding_sk}")` (`policy_engine.handler.approval_id_for`) — so the idempotency check is a single `GetItem`, with no GSI. The policy engine re-dispatches `prompt` whenever a finding's stored `policy_decision` differs from the computed one (the detector resets it to `dry_run` on each run), so approval creation **must** be idempotent: if a pending approval already exists, log and skip — never create a second.

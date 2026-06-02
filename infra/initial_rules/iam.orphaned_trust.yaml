@@ -1,0 +1,16 @@
+rule: iam.orphaned_trust
+enabled: true
+schedule: on-demand
+threshold:
+  # Pattern-based (orphan principals); no numeric threshold.
+  enabled: true
+forecast:
+  enabled: false
+grace_period_days: 0
+policy:
+  default: prompt
+  overrides:
+    - match: { Environment: nonprod }
+      action: auto
+notifications:
+  channels: [eventbridge, sns]
