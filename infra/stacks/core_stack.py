@@ -57,6 +57,23 @@ INITIAL_RULES_DIR = Path(__file__).resolve().parents[1] / "initial_rules"
 # SSM Automation runbooks (repo root / runbooks).
 RUNBOOKS_DIR = Path(__file__).resolve().parents[2] / "runbooks"
 DELETE_IAM_ROLE_DOC_NAME = "TidewaterDeleteIamRole"
+# Phase 5 runbooks: SSM document name -> runbook YAML file.
+PHASE5_DOCUMENTS = {
+    "TidewaterDeleteIamAccessKey": "delete_iam_access_key.yml",
+    "TidewaterRemoveTrustPrincipal": "remove_trust_principal.yml",
+    "TidewaterDeleteUnusedPolicy": "delete_unused_policy.yml",
+    "TidewaterDetachUnusedPolicy": "detach_unused_policy.yml",
+}
+ALL_DOCUMENT_NAMES = [DELETE_IAM_ROLE_DOC_NAME, *PHASE5_DOCUMENTS]
+
+# rule_id -> (rules-yaml S3 key) for the rules_meta seed rows.
+PHASE5_RULES = [
+    "iam.wildcard_policy",
+    "iam.stale_access_key",
+    "iam.orphaned_trust",
+    "iam.unused_policy",
+    "iam.policy_quota",
+]
 
 # Buckets whose removal policy is RETAIN (the audit trail must survive teardown).
 RETAIN_BUCKETS = {"audit-log", "snapshots"}
@@ -599,13 +616,26 @@ class CoreStack(Stack):
         )
         fn = detector.function
 
-        # Read-only IAM access — never anything destructive (that's Phase 4's remediator).
+        # Read-only IAM access — never anything destructive (that's the remediator).
         fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=[
                     "iam:ListRoles",
                     "iam:GetRole",
+                    "iam:GetUser",
+                    "iam:ListUsers",
                     "iam:ListRoleTags",
+                    "iam:ListUserTags",
+                    "iam:ListPolicyTags",
+                    "iam:ListAttachedRolePolicies",
+                    "iam:ListRolePolicies",
+                    "iam:GetRolePolicy",
+                    "iam:ListAccessKeys",
+                    "iam:GetAccessKeyLastUsed",
+                    "iam:ListPolicies",
+                    "iam:GetPolicy",
+                    "iam:GetPolicyVersion",
+                    "iam:ListEntitiesForPolicy",
                     "iam:GenerateServiceLastAccessedDetails",
                     "iam:GetServiceLastAccessedDetails",
                 ],
@@ -652,6 +682,23 @@ class CoreStack(Stack):
                 "Schedule": "on-demand",
             },
         )
+        # Phase 5: seed one rules_meta row per new rule (same Custom Resource).
+        for rule_id in PHASE5_RULES:
+            construct_id = "RulesMeta" + "".join(part.title() for part in rule_id.split("."))
+            CustomResource(
+                self,
+                construct_id,
+                service_token=seed_provider.service_token,
+                resource_type="Custom::RulesMetaSeed",
+                properties={
+                    "TableName": rules_meta_table.table_name,
+                    "RuleId": rule_id,
+                    "Enabled": "true",
+                    "Version": "1",
+                    "S3Key": f"rules/{rule_id}.yaml",
+                    "Schedule": "on-demand",
+                },
+            )
 
         return fn.function_name
 
@@ -672,7 +719,7 @@ class CoreStack(Stack):
             "SsmExecutionRole",
             role_name="TidewaterSsmExecutionRole",
             assumed_by=iam.ServicePrincipal("ssm.amazonaws.com"),
-            description="Assumed by the IAM-role-deletion SSM runbook (only its needed perms).",
+            description="Assumed by the IAM remediation SSM runbooks (only their needed perms).",
         )
         ssm_role.add_to_policy(
             iam.PolicyStatement(
@@ -686,11 +733,50 @@ class CoreStack(Stack):
                     "iam:DeleteRolePolicy",
                     "iam:RemoveRoleFromInstanceProfile",
                     "iam:DeleteRole",
+                    # Phase 5 runbooks (role-scoped mutations + reads).
+                    "iam:UpdateAssumeRolePolicy",
                 ],
                 resources=[
                     f"arn:aws:iam::{self.account}:role/*",
                     f"arn:aws:iam::{self.account}:instance-profile/*",
                 ],
+            )
+        )
+        # Phase 5: user-scoped reads + access-key deactivation (never DeleteAccessKey).
+        ssm_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "iam:GetUser",
+                    "iam:GetAccessKeyLastUsed",
+                    "iam:ListAttachedUserPolicies",
+                    "iam:ListUserPolicies",
+                    "iam:UpdateAccessKey",
+                ],
+                resources=[f"arn:aws:iam::{self.account}:user/*"],
+            )
+        )
+        # Phase 5: customer-managed policy reads + deletion (delete_unused_policy).
+        ssm_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "iam:ListPolicyVersions",
+                    "iam:GetPolicyVersion",
+                    "iam:ListEntitiesForPolicy",
+                    "iam:DeletePolicyVersion",
+                    "iam:DeletePolicy",
+                ],
+                resources=[f"arn:aws:iam::{self.account}:policy/*"],
+            )
+        )
+        # Phase 5: service-last-accessed analysis for least-recently-used detach.
+        # GetServiceLastAccessedDetails keys off a JobId, so it is not resource-scopable.
+        ssm_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "iam:GenerateServiceLastAccessedDetails",
+                    "iam:GetServiceLastAccessedDetails",
+                ],
+                resources=["*"],
             )
         )
         snapshots_bucket.grant_put(ssm_role)
@@ -709,16 +795,29 @@ class CoreStack(Stack):
             document_type="Automation",
             content=runbook_content,
         )
+        # Phase 5 remediation documents (one CfnDocument per runbook).
+        for doc_name, filename in PHASE5_DOCUMENTS.items():
+            ssm.CfnDocument(
+                self,
+                doc_name + "Document",
+                name=doc_name,
+                document_type="Automation",
+                content=yaml.safe_load((RUNBOOKS_DIR / filename).read_text()),
+            )
+
         # ssm:StartAutomationExecution is authorized against the document/ ARN today;
         # the automation-definition/ format is being deprecated (kept for backward
         # compat per AWS migration guidance), and automation-execution/ is needed
         # once a run starts. This mirrors AWS's own
         # AWS-SSM-DiagnosisAutomation-AdministrationRolePolicy.
         start_automation_resources = [
-            f"arn:aws:ssm:{self.region}:{self.account}:document/{DELETE_IAM_ROLE_DOC_NAME}",
             f"arn:aws:ssm:{self.region}:{self.account}:automation-execution/*",
-            f"arn:aws:ssm:{self.region}:{self.account}:automation-definition/{DELETE_IAM_ROLE_DOC_NAME}:*",
         ]
+        for doc_name in ALL_DOCUMENT_NAMES:
+            start_automation_resources += [
+                f"arn:aws:ssm:{self.region}:{self.account}:document/{doc_name}",
+                f"arn:aws:ssm:{self.region}:{self.account}:automation-definition/{doc_name}:*",
+            ]
 
         # --- Remediator Lambda (starts SSM Automation; never deletes directly). ---
         remediator_dlq = sqs.Queue(
