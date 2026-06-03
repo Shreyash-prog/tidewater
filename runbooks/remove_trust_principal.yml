@@ -64,7 +64,7 @@ mainSteps:
                 "role": role,
                 "current_trust_policy": role.get("AssumeRolePolicyDocument", {}),
                 "orphan_principals_removed": events["OrphanPrincipals"],
-                "snapshot_metadata": {"snapshot_at": now.isoformat(), "taken_by": "TidewaterRemoveTrustPrincipal", "finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"]},
+                "snapshot_metadata": {"snapshot_at": now.isoformat(), "taken_by": "TidewaterRemoveTrustPrincipalV2", "finding_pk": events["FindingPk"], "finding_sk": events["FindingSk"]},
             }
             key = "iam/trust/" + events["RoleName"] + "/" + now.strftime("%Y%m%dT%H%M%SZ") + ".json"
             return {"SnapshotJson": json.dumps(snapshot, default=str), "SnapshotKey": key}

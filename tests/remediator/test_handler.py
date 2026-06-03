@@ -147,7 +147,7 @@ def test_orphaned_trust_builds_role_and_principal_list(aws: Any) -> None:
     assert result["status"] == "started"
     ((args, _),) = rm._start_automation.calls
     document_name, parameters = args
-    assert document_name == "TidewaterRemoveTrustPrincipal"
+    assert document_name == "TidewaterRemoveTrustPrincipalV2"
     assert parameters["RoleName"] == ["app-role"]
     # Both forms are flattened to the bare principal strings the runbook strips.
     assert parameters["OrphanPrincipals"] == [
