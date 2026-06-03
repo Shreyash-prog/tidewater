@@ -61,9 +61,16 @@ def _params_stale_access_key(item: dict[str, Any]) -> dict[str, list[str]]:
 
 def _params_orphaned_trust(item: dict[str, Any]) -> dict[str, list[str]]:
     details = item.get("details", {})
+    # orphan_principals entries are {"type", "principal"} dicts; the runbook only
+    # needs the principal strings (ARN or bare unique ID) to strip from the trust
+    # policy. Tolerate the legacy bare-string form just in case.
+    principals = [
+        str(entry["principal"]) if isinstance(entry, dict) else str(entry)
+        for entry in details["orphan_principals"]
+    ]
     return {
         "RoleName": [str(details["role_name"])],
-        "OrphanPrincipals": [str(p) for p in details["orphan_principals"]],
+        "OrphanPrincipals": principals,
     }
 
 
