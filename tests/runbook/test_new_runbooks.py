@@ -2,8 +2,12 @@
 
 Asserts, per runbook: required parameters are declared, the guardrail step exists
 (where applicable), and the snapshot is written before any mutating step.
+
+Also executes the trust-policy rewrite logic of remove_trust_principal.yml
+in-process to prove it strips both orphan forms (ARN + bare unique ID).
 """
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -126,3 +130,66 @@ def test_access_key_runbook_deactivates_not_deletes() -> None:
     apis = [s.get("inputs", {}).get("Api") for s in doc["mainSteps"]]
     assert "UpdateAccessKey" in apis  # deactivation
     assert "DeleteAccessKey" not in apis  # never auto-delete
+
+
+def _compute_new_trust_policy(role: dict[str, Any], orphans: list[str]) -> Any:
+    """Run remove_trust_principal.yml's computeNewTrustPolicy script in-process."""
+    doc = _doc("remove_trust_principal.yml")
+    step = next(s for s in doc["mainSteps"] if s["name"] == "computeNewTrustPolicy")
+    namespace: dict[str, Any] = {}
+    exec(step["inputs"]["Script"], namespace)  # noqa: S102 — trusted runbook source
+    events = {"RoleJson": json.dumps(role), "OrphanPrincipals": orphans}
+    return namespace["handler"](events, None)
+
+
+def test_trust_rewrite_removes_both_arn_and_bare_id_orphans() -> None:
+    # The deleted-user case: a bare AIDA* id alongside an ARN-format orphan and one
+    # valid principal. Both orphans must be stripped; the valid principal stays.
+    valid = "arn:aws:iam::111111111111:role/valid"
+    role = {
+        "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "AWS": [
+                            valid,
+                            "arn:aws:iam::111111111111:user/deleted-user",
+                            "AIDASITUILUEC7BNIGN7A",
+                        ]
+                    },
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        }
+    }
+    result = _compute_new_trust_policy(
+        role,
+        orphans=["arn:aws:iam::111111111111:user/deleted-user", "AIDASITUILUEC7BNIGN7A"],
+    )
+    new_doc = json.loads(result["NewPolicyJson"])
+    remaining = new_doc["Statement"][0]["Principal"]["AWS"]
+    # A single remaining principal collapses to a string, per the runbook logic.
+    assert remaining == valid
+    assert "AIDASITUILUEC7BNIGN7A" not in json.dumps(new_doc)
+    assert "deleted-user" not in json.dumps(new_doc)
+
+
+def test_trust_rewrite_aborts_when_only_orphan_bare_id_would_be_removed() -> None:
+    # If the sole principal is a bare-id orphan, removing it would leave the role
+    # unassumable — the runbook must abort rather than write an empty policy.
+    role = {
+        "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "AIDASITUILUEC7BNIGN7A"},
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        }
+    }
+    with pytest.raises(Exception, match="unassumable"):
+        _compute_new_trust_policy(role, orphans=["AIDASITUILUEC7BNIGN7A"])

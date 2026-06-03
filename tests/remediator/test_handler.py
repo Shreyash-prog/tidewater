@@ -135,7 +135,10 @@ def test_orphaned_trust_builds_role_and_principal_list(aws: Any) -> None:
         resource_arn=arn,
         details={
             "role_name": "app-role",
-            "orphan_principals": ["arn:aws:iam::111:role/gone", "arn:aws:iam::111:user/gone"],
+            "orphan_principals": [
+                {"type": "arn", "principal": "arn:aws:iam::111:user/gone"},
+                {"type": "unique_id", "principal": "AIDASITUILUEC7BNIGN7A"},
+            ],
         },
     )
 
@@ -146,9 +149,10 @@ def test_orphaned_trust_builds_role_and_principal_list(aws: Any) -> None:
     document_name, parameters = args
     assert document_name == "TidewaterRemoveTrustPrincipal"
     assert parameters["RoleName"] == ["app-role"]
+    # Both forms are flattened to the bare principal strings the runbook strips.
     assert parameters["OrphanPrincipals"] == [
-        "arn:aws:iam::111:role/gone",
         "arn:aws:iam::111:user/gone",
+        "AIDASITUILUEC7BNIGN7A",
     ]
 
 
