@@ -193,3 +193,83 @@ def test_trust_rewrite_aborts_when_only_orphan_bare_id_would_be_removed() -> Non
     }
     with pytest.raises(Exception, match="unassumable"):
         _compute_new_trust_policy(role, orphans=["AIDASITUILUEC7BNIGN7A"])
+
+
+def test_trust_rewrite_drops_statement_left_with_empty_principal() -> None:
+    # The MalformedPolicyDocument case: two statements, the second's SOLE principal
+    # is a bare-id orphan. Removing the AWS key would leave an empty Principal,
+    # which AWS rejects — so the whole statement must be dropped, leaving the
+    # valid :root statement intact.
+    root = "arn:aws:iam::111111111111:root"
+    role = {
+        "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": root},
+                    "Action": "sts:AssumeRole",
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "AIDASITUILUEO4F4JRVBG"},
+                    "Action": "sts:AssumeRole",
+                },
+            ],
+        }
+    }
+    result = _compute_new_trust_policy(role, orphans=["AIDASITUILUEO4F4JRVBG"])
+    new_trust = json.loads(result["NewPolicyJson"])
+    assert len(new_trust["Statement"]) == 1
+    assert new_trust["Statement"][0]["Principal"]["AWS"] == root
+    assert "AIDASITUILUEO4F4JRVBG" not in json.dumps(new_trust)
+
+
+def test_trust_rewrite_keeps_statement_with_remaining_aws_principals() -> None:
+    # Orphan is one of several AWS principals on a single statement: the statement
+    # is kept with its principal list reduced, never dropped.
+    root = "arn:aws:iam::111111111111:root"
+    role = {
+        "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": [root, "AIDASITUILUEO4F4JRVBG"]},
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        }
+    }
+    result = _compute_new_trust_policy(role, orphans=["AIDASITUILUEO4F4JRVBG"])
+    new_trust = json.loads(result["NewPolicyJson"])
+    assert len(new_trust["Statement"]) == 1
+    # Single remaining principal collapses to a string.
+    assert new_trust["Statement"][0]["Principal"]["AWS"] == root
+
+
+def test_trust_rewrite_keeps_statement_with_other_principal_kinds() -> None:
+    # A mixed-trust statement (AWS + Service, e.g. a Lambda exec role): even when
+    # ALL AWS principals are orphans, the statement survives because the Service
+    # principal remains — only the now-empty AWS key is dropped.
+    role = {
+        "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "AWS": "AIDASITUILUEO4F4JRVBG",
+                        "Service": "lambda.amazonaws.com",
+                    },
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        }
+    }
+    result = _compute_new_trust_policy(role, orphans=["AIDASITUILUEO4F4JRVBG"])
+    new_trust = json.loads(result["NewPolicyJson"])
+    assert len(new_trust["Statement"]) == 1
+    principal = new_trust["Statement"][0]["Principal"]
+    assert principal == {"Service": "lambda.amazonaws.com"}
+    assert "AWS" not in principal
