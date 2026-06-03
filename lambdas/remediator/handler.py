@@ -37,7 +37,7 @@ ACTOR = "remediator"
 REGISTRY: dict[str, str] = {
     "iam.unused_role": "TidewaterDeleteIamRole",
     "iam.stale_access_key": "TidewaterDeleteIamAccessKey",
-    "iam.orphaned_trust": "TidewaterRemoveTrustPrincipal",
+    "iam.orphaned_trust": "TidewaterRemoveTrustPrincipalV2",
     "iam.unused_policy": "TidewaterDeleteUnusedPolicy",
     "iam.policy_quota": "TidewaterDetachUnusedPolicy",
 }

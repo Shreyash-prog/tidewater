@@ -58,9 +58,13 @@ INITIAL_RULES_DIR = Path(__file__).resolve().parents[1] / "initial_rules"
 RUNBOOKS_DIR = Path(__file__).resolve().parents[2] / "runbooks"
 DELETE_IAM_ROLE_DOC_NAME = "TidewaterDeleteIamRole"
 # Phase 5 runbooks: SSM document name -> runbook YAML file.
+# NOTE: CloudFormation cannot update a custom-named AWS::SSM::Document whose body
+# changes (it would require replacement of a named resource, which CFN refuses).
+# Bumping the version suffix (e.g. V2 -> V3) when a runbook's logic changes makes
+# CFN treat it as a new document. See CLAUDE.md "SSM Document maintenance".
 PHASE5_DOCUMENTS = {
     "TidewaterDeleteIamAccessKey": "delete_iam_access_key.yml",
-    "TidewaterRemoveTrustPrincipal": "remove_trust_principal.yml",
+    "TidewaterRemoveTrustPrincipalV2": "remove_trust_principal.yml",
     "TidewaterDeleteUnusedPolicy": "delete_unused_policy.yml",
     "TidewaterDetachUnusedPolicy": "detach_unused_policy.yml",
 }

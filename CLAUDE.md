@@ -64,6 +64,11 @@ This is a POC of a platform hygiene framework for AWS. You are helping build it.
 - `delete_iam_access_key.yml` **deactivates only** (`UpdateAccessKey Status=Inactive`) — it never calls `DeleteAccessKey`. Key deletion is irreversible and the secret can't be snapshotted, so full deletion is an operator-driven action, never automatic.
 - SSM-runbook IAM permissions live on `TidewaterSsmExecutionRole`, scoped by resource type (role/ vs user/ vs policy/); service-last-accessed APIs key off a JobId and can't be resource-scoped, so they're granted on `*`.
 
+### SSM Document maintenance
+
+- **CloudFormation cannot update a custom-named `AWS::SSM::Document` whose body changes.** Changing the runbook YAML makes CFN see a replacement of a named resource, which it refuses: *"CloudFormation cannot update a stack when a custom-named resource requires replacing."* The fix is to **rename** the document — bump a version suffix (`V2 → V3 → …`) so CFN treats it as a new resource (old one deleted, new one created from the updated body).
+- **When you change a runbook's logic, bump its version suffix in the same PR** in two places: the document name in `PHASE5_DOCUMENTS` (`infra/stacks/core_stack.py`) — which flows automatically to the `CfnDocument` name and the remediator's `ssm:StartAutomationExecution` grant ARNs via `ALL_DOCUMENT_NAMES` — and the matching `REGISTRY` value in `lambdas/remediator/handler.py`. Keep the document name and the REGISTRY value identical or dispatch breaks.
+
 ### Approval idempotency
 
 - **One approval per finding, ever.** Approval rows are keyed by a deterministic id — `appr_` + the first 24 hex chars of `sha256("{finding_pk}|{finding_sk}")` (`policy_engine.handler.approval_id_for`) — so the idempotency check is a single `GetItem`, with no GSI. The policy engine re-dispatches `prompt` whenever a finding's stored `policy_decision` differs from the computed one (the detector resets it to `dry_run` on each run), so approval creation **must** be idempotent: if a pending approval already exists, log and skip — never create a second.
