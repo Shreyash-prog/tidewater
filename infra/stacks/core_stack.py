@@ -57,26 +57,30 @@ INITIAL_RULES_DIR = Path(__file__).resolve().parents[1] / "initial_rules"
 # SSM Automation runbooks (repo root / runbooks).
 RUNBOOKS_DIR = Path(__file__).resolve().parents[2] / "runbooks"
 DELETE_IAM_ROLE_DOC_NAME = "TidewaterDeleteIamRole"
-# Phase 5 runbooks: SSM document name -> runbook YAML file.
+# Remediation runbooks across all phases: SSM document name -> runbook YAML file.
+# (Renamed from PHASE5_DOCUMENTS in Phase 6 — it is no longer phase-specific.)
 # NOTE: CloudFormation cannot update a custom-named AWS::SSM::Document whose body
 # changes (it would require replacement of a named resource, which CFN refuses).
 # Bumping the version suffix (e.g. V2 -> V3) when a runbook's logic changes makes
 # CFN treat it as a new document. See CLAUDE.md "SSM Document maintenance".
-PHASE5_DOCUMENTS = {
+RUNBOOK_DOCUMENTS = {
     "TidewaterDeleteIamAccessKey": "delete_iam_access_key.yml",
     "TidewaterRemoveTrustPrincipalV2": "remove_trust_principal.yml",
     "TidewaterDeleteUnusedPolicy": "delete_unused_policy.yml",
     "TidewaterDetachUnusedPolicy": "detach_unused_policy.yml",
+    "TidewaterDeleteUnusedFunction": "delete_unused_function.yml",  # Phase 6
 }
-ALL_DOCUMENT_NAMES = [DELETE_IAM_ROLE_DOC_NAME, *PHASE5_DOCUMENTS]
+ALL_DOCUMENT_NAMES = [DELETE_IAM_ROLE_DOC_NAME, *RUNBOOK_DOCUMENTS]
 
-# rule_id -> (rules-yaml S3 key) for the rules_meta seed rows.
-PHASE5_RULES = [
+# rule_ids seeded into rules_meta beyond iam.unused_role, serialized at deploy.
+# (Renamed from PHASE5_RULES in Phase 6.)
+EXTRA_SEED_RULES = [
     "iam.wildcard_policy",
     "iam.stale_access_key",
     "iam.orphaned_trust",
     "iam.unused_policy",
     "iam.policy_quota",
+    "lambda.unused_function",  # Phase 6
 ]
 
 # Buckets whose removal policy is RETAIN (the audit trail must survive teardown).
@@ -142,6 +146,11 @@ class CoreStack(Stack):
             rules_meta_table=tables["rules_meta"],
             bus=bus,
         )
+        lambda_detector_name = self._lambda_detector(
+            rules_bucket=buckets["rules-yaml"],
+            findings_table=tables["findings"],
+            bus=bus,
+        )
         policy_engine_name, remediator_name = self._policy_and_remediation(
             findings_table=tables["findings"],
             approvals_table=tables["approvals"],
@@ -160,6 +169,7 @@ class CoreStack(Stack):
             notifications_topic=notifications_topic,
             deploy_version=deploy_version,
             iam_detector_name=iam_detector_name,
+            lambda_detector_name=lambda_detector_name,
             policy_engine_name=policy_engine_name,
             remediator_name=remediator_name,
         )
@@ -698,7 +708,7 @@ class CoreStack(Stack):
                 "Schedule": "on-demand",
             },
         )
-        # Phase 5: seed one rules_meta row per new rule (same Custom Resource).
+        # Seed one rules_meta row per extra rule (same Custom Resource).
         # These are created in series via explicit CloudFormation DependsOn edges:
         # CFN otherwise invokes the single backing provider Lambda once per rule
         # concurrently, tripping AWS Lambda's control-plane Invoke rate limit
@@ -706,7 +716,7 @@ class CoreStack(Stack):
         # provider invocation in flight at a time. This is orchestration-level
         # throttling, not a Lambda-side retry concern.
         rules_meta_resources: list[CustomResource] = []
-        for rule_id in PHASE5_RULES:
+        for rule_id in EXTRA_SEED_RULES:
             construct_id = "RulesMeta" + "".join(part.title() for part in rule_id.split("."))
             resource = CustomResource(
                 self,
@@ -727,6 +737,59 @@ class CoreStack(Stack):
                 resource.node.add_dependency(rules_meta_resources[-1])
             rules_meta_resources.append(resource)
 
+        return fn.function_name
+
+    # --------------------------------------------------------------- Lambda detector
+    def _lambda_detector(
+        self,
+        *,
+        rules_bucket: s3.Bucket,
+        findings_table: dynamodb.Table,
+        bus: events.EventBus,
+    ) -> str:
+        # The rule YAML + rules_meta row ship via the IAM detector's RulesDeployment
+        # and seed chain (which now includes lambda.unused_function); this method
+        # only stands up the detector Lambda and its read-only grants.
+        dlq = sqs.Queue(
+            self,
+            "LambdaDetectorDlq",
+            queue_name="lambda-detector-dlq",
+            retention_period=Duration.days(14),
+        )
+        detector = PythonLambda(
+            self,
+            "LambdaDetector",
+            entry="lambdas/detectors/lambda_",
+            handler="detectors.lambda_.handler.handler",
+            include_shared=True,
+            memory_size=512,
+            timeout=Duration.minutes(5),
+            dead_letter_queue=dlq,
+            environment={
+                "RULES_BUCKET": rules_bucket.bucket_name,
+                "FINDINGS_TABLE": findings_table.table_name,
+                "EVENT_BUS_NAME": bus.event_bus_name,
+            },
+            description="Detects unused Lambda functions (lambda.unused_function). On-demand.",
+        )
+        fn = detector.function
+        # Read-only signal sources. List/metric APIs don't take a function ARN, so
+        # they are granted on "*" (never any destructive action — that's the runbook).
+        fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "lambda:ListFunctions",
+                    "lambda:ListTags",
+                    "cloudwatch:GetMetricStatistics",
+                ],
+                resources=["*"],
+            )
+        )
+        rules_bucket.grant_read(fn)
+        findings_table.grant(
+            fn, "dynamodb:BatchWriteItem", "dynamodb:UpdateItem", "dynamodb:GetItem"
+        )
+        bus.grant_put_events_to(fn)
         return fn.function_name
 
     # ----------------------------------------------------- Policy engine + remediator
@@ -806,6 +869,23 @@ class CoreStack(Stack):
                 resources=["*"],
             )
         )
+        # Phase 6: delete_unused_function runbook — function-scoped reads + delete.
+        ssm_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "lambda:GetFunction",
+                    "lambda:GetFunctionUrlConfig",
+                    "lambda:GetPolicy",
+                    "lambda:DeleteFunction",
+                ],
+                resources=[f"arn:aws:lambda:{self.region}:{self.account}:function:*"],
+            )
+        )
+        # ListEventSourceMappings filters by function but the action is not
+        # resource-scopable (its resource is the mapping), so it is granted on "*".
+        ssm_role.add_to_policy(
+            iam.PolicyStatement(actions=["lambda:ListEventSourceMappings"], resources=["*"])
+        )
         snapshots_bucket.grant_put(ssm_role)
         audit_bucket.grant_put(ssm_role)
         findings_table.grant(ssm_role, "dynamodb:UpdateItem")
@@ -822,8 +902,8 @@ class CoreStack(Stack):
             document_type="Automation",
             content=runbook_content,
         )
-        # Phase 5 remediation documents (one CfnDocument per runbook).
-        for doc_name, filename in PHASE5_DOCUMENTS.items():
+        # Remediation documents (one CfnDocument per runbook).
+        for doc_name, filename in RUNBOOK_DOCUMENTS.items():
             ssm.CfnDocument(
                 self,
                 doc_name + "Document",
@@ -965,11 +1045,13 @@ class CoreStack(Stack):
         notifications_topic: sns.Topic,
         deploy_version: CfnParameter,
         iam_detector_name: str,
+        lambda_detector_name: str,
         policy_engine_name: str,
         remediator_name: str,
     ) -> None:
         outputs: dict[str, str] = {
             "IamDetectorLambdaName": iam_detector_name,
+            "LambdaDetectorLambdaName": lambda_detector_name,
             "PolicyEngineLambdaName": policy_engine_name,
             "RemediatorLambdaName": remediator_name,
             "SsmDocumentName": DELETE_IAM_ROLE_DOC_NAME,

@@ -192,6 +192,26 @@ def test_policy_quota_builds_role_name_param(aws: Any) -> None:
     assert parameters["RoleName"] == ["overloaded"]
 
 
+def test_unused_function_builds_function_and_account_params(aws: Any) -> None:
+    arn = "arn:aws:lambda:us-east-1:111:function:idle-fn"
+    sk = _put_finding(
+        aws,
+        rule_id="lambda.unused_function",
+        resource_arn=arn,
+        details={"function_name": "idle-fn", "runtime": "python3.12"},
+    )
+
+    result = rm.handler({"finding_pk": PK, "finding_sk": sk}, _context())
+
+    assert result["status"] == "started"
+    ((args, _),) = rm._start_automation.calls
+    document_name, parameters = args
+    assert document_name == "TidewaterDeleteUnusedFunction"
+    assert parameters["FunctionName"] == ["idle-fn"]
+    # AccountId is derived from the finding pk (account#region#service).
+    assert parameters["AccountId"] == ["111"]
+
+
 def test_wildcard_policy_is_never_remediated(aws: Any) -> None:
     # Flag-only rule: even if a finding somehow reaches the remediator, there is
     # no runbook and SSM is never started.

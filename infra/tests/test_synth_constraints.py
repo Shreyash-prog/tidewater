@@ -93,6 +93,38 @@ def test_findings_table_has_resource_arn_status_index(resources: dict[str, dict]
     assert key_schema == {"HASH": "resource_arn", "RANGE": "status"}
 
 
+def test_lambda_detector_function_exists(resources: dict[str, dict]) -> None:
+    fns = {
+        name: v
+        for name, v in _of_type(resources, "AWS::Lambda::Function").items()
+        if name.startswith("LambdaDetectorFunction")
+    }
+    assert len(fns) == 1, fns
+    (props,) = (v["Properties"] for v in fns.values())
+    assert props["Runtime"] == "python3.12"
+    assert props["MemorySize"] == 512
+    assert props["Timeout"] == 300
+
+
+def test_delete_unused_function_document_synthesized(resources: dict[str, dict]) -> None:
+    names = {v["Properties"]["Name"] for v in _of_type(resources, "AWS::SSM::Document").values()}
+    assert "TidewaterDeleteUnusedFunction" in names, names
+
+
+def test_ssm_execution_role_can_delete_functions(resources: dict[str, dict]) -> None:
+    # The delete_unused_function runbook runs under TidewaterSsmExecutionRole.
+    roles = {
+        name: v
+        for name, v in _of_type(resources, "AWS::IAM::Role").items()
+        if v["Properties"].get("RoleName") == "TidewaterSsmExecutionRole"
+    }
+    assert len(roles) == 1, roles
+    (role_id,) = roles
+    actions = _actions_granted_to_role(resources, role_id)
+    assert "lambda:DeleteFunction" in actions, f"SSM role lacks DeleteFunction: {sorted(actions)}"
+    assert "lambda:GetFunction" in actions
+
+
 def test_policy_engine_can_query_findings_index(resources: dict[str, dict]) -> None:
     # The in-flight check is a Query against the GSI; without dynamodb:Query the
     # check fails closed at runtime (the exact drift the boto3<->IAM audit guards).

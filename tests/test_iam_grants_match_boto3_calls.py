@@ -1,19 +1,18 @@
-"""Meta-test: every IAM API a detector calls must be granted to its Lambda role.
+"""Meta-test: every AWS API a detector calls must be granted to its Lambda role.
 
-The IAM detectors call read-only IAM APIs directly via boto3. Their execution
-role's permissions are hand-curated in `core_stack.py` (not derived from a CDK
-`grant_*` helper), so they can silently drift out of sync with the code: add a
-new `iam.get_*` call without the matching grant and the detector throws
-AccessDenied only at runtime, in production.
+The detectors call read-only AWS APIs directly via boto3. Their execution-role
+permissions are hand-curated in `core_stack.py` (not derived from a CDK `grant_*`
+helper), so they can silently drift out of sync with the code: add a new call
+without the matching grant and the detector throws AccessDenied only at runtime,
+in production.
 
-This test closes that gap. It statically scans the detector source for boto3 IAM
-method names (direct calls, attribute references passed as callables, and
-`get_paginator("...")` arguments), maps each to its IAM action, and asserts the
-synthesized detector role grants it.
+This test closes that gap. For each scanned detector tree it statically finds the
+boto3 method names referenced (direct calls, attribute references passed as
+callables, and `get_paginator("...")` arguments), maps each to its IAM action,
+and asserts the synthesized detector role grants it.
 
-Adding a new IAM call? Add the boto3 method -> IAM action pair to
-BOTO3_METHOD_TO_IAM_ACTION below AND grant the action in core_stack.py. This test
-fails loudly until you do both.
+Adding a new call? Add the boto3 method -> action pair to that tree's method map
+below AND grant the action in core_stack.py. This test fails until you do both.
 """
 
 import ast
@@ -28,9 +27,7 @@ from infra.stacks.core_stack import CoreStack
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV = cdk.Environment(account="123456789012", region="us-east-1")
 
-# boto3 IAM method name -> the IAM action it requires. This is the contract: if a
-# detector calls a method not listed here, the test cannot verify its grant and
-# fails (forcing the map to be kept complete).
+# boto3 method name -> the IAM action it requires, for the IAM detector tree.
 BOTO3_METHOD_TO_IAM_ACTION: dict[str, str] = {
     "list_roles": "iam:ListRoles",
     "get_role": "iam:GetRole",
@@ -52,30 +49,45 @@ BOTO3_METHOD_TO_IAM_ACTION: dict[str, str] = {
     "get_service_last_accessed_details": "iam:GetServiceLastAccessedDetails",
 }
 
-# Source tree to scan -> synthesized Lambda function logical-id prefix.
-HANDLER_TO_LAMBDA_LOGICAL_ID: dict[str, str] = {
-    "lambdas/detectors/iam": "IamDetectorFunction",
+# boto3 method name -> action, for the Lambda detector tree (lambda + cloudwatch).
+BOTO3_METHOD_TO_LAMBDA_ACTION: dict[str, str] = {
+    "list_functions": "lambda:ListFunctions",
+    "list_tags": "lambda:ListTags",
+    "get_metric_statistics": "cloudwatch:GetMetricStatistics",
 }
 
-_IAM_METHOD_NAMES = frozenset(BOTO3_METHOD_TO_IAM_ACTION)
+# Each scanned detector tree, its synthesized Lambda logical-id prefix, and the
+# method->action map that governs it.
+SCAN_TARGETS = [
+    ("lambdas/detectors/iam", "IamDetectorFunction", BOTO3_METHOD_TO_IAM_ACTION),
+    ("lambdas/detectors/lambda_", "LambdaDetectorFunction", BOTO3_METHOD_TO_LAMBDA_ACTION),
+]
+
+# Verb prefixes that mark a boto3 call as an AWS API (for the completeness check).
+_AWS_VERB_PREFIXES = (
+    "get_",
+    "list_",
+    "generate_",
+    "update_",
+    "delete_",
+    "detach_",
+    "attach_",
+)
 
 
-def _iam_methods_called_in(tree_dir: Path) -> set[str]:
-    """All boto3 IAM method names referenced anywhere under ``tree_dir``.
+def _methods_called_in(tree_dir: Path, method_names: frozenset[str]) -> set[str]:
+    """All boto3 method names from ``method_names`` referenced under ``tree_dir``.
 
-    Catches three call shapes the detectors use:
-      * direct calls            ``iam.get_role(...)``
-      * callable references     ``self._exists(self.iam.get_user, ...)``
-      * paginators              ``iam.get_paginator("list_roles")``
+    Catches three call shapes: direct calls (``iam.get_role(...)``), bare callable
+    references (``self._exists(self.iam.get_user, ...)``), and paginator strings
+    (``client.get_paginator("list_roles")``).
     """
     found: set[str] = set()
     for path in sorted(tree_dir.rglob("*.py")):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
-            # Attribute access (covers both calls and bare references).
-            if isinstance(node, ast.Attribute) and node.attr in _IAM_METHOD_NAMES:
+            if isinstance(node, ast.Attribute) and node.attr in method_names:
                 found.add(node.attr)
-            # get_paginator("method_name") string argument.
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -85,9 +97,26 @@ def _iam_methods_called_in(tree_dir: Path) -> set[str]:
                 and isinstance(node.args[0].value, str)
             ):
                 method = node.args[0].value
-                if method in _IAM_METHOD_NAMES:
+                if method in method_names:
                     found.add(method)
     return found
+
+
+def _paginator_strings_in(tree_dir: Path) -> set[str]:
+    strings: set[str] = set()
+    for path in tree_dir.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get_paginator"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                strings.add(node.args[0].value)
+    return strings
 
 
 @pytest.fixture(scope="module")
@@ -122,45 +151,43 @@ def _actions_granted_to_role(resources: dict[str, dict], role_id: str) -> set[st
 
 
 @pytest.mark.parametrize(
-    ("tree", "logical_id_prefix"), sorted(HANDLER_TO_LAMBDA_LOGICAL_ID.items())
+    ("tree", "logical_id_prefix", "method_map"),
+    SCAN_TARGETS,
+    ids=[t[0] for t in SCAN_TARGETS],
 )
-def test_every_iam_call_has_a_matching_grant(
-    resources: dict[str, dict], tree: str, logical_id_prefix: str
+def test_every_api_call_has_a_matching_grant(
+    resources: dict[str, dict],
+    tree: str,
+    logical_id_prefix: str,
+    method_map: dict[str, str],
 ) -> None:
-    called = _iam_methods_called_in(_REPO_ROOT / tree)
-    assert called, f"no IAM boto3 calls discovered under {tree}; scanner likely broken"
+    called = _methods_called_in(_REPO_ROOT / tree, frozenset(method_map))
+    assert called, f"no mapped boto3 calls discovered under {tree}; scanner likely broken"
 
-    required = {BOTO3_METHOD_TO_IAM_ACTION[m] for m in called}
+    required = {method_map[m] for m in called}
     role_id = _role_id_for_function_prefix(resources, logical_id_prefix)
     granted = _actions_granted_to_role(resources, role_id)
 
     missing = required - granted
     assert not missing, (
-        f"{tree} calls IAM APIs whose actions are not granted to {logical_id_prefix}: "
+        f"{tree} calls APIs whose actions are not granted to {logical_id_prefix}: "
         f"{sorted(missing)}. Add the grant in core_stack.py."
     )
 
 
-def test_method_map_is_complete_for_scanned_trees() -> None:
-    # Guard against the scanner silently ignoring an unmapped IAM method: every
-    # IAM-looking boto3 method in a scanned tree must appear in the map. (The
-    # scanner already filters to mapped names; this asserts no get_paginator
-    # string or attribute slips past because we forgot to map it.)
-    unmapped: set[str] = set()
-    iam_verbs = ("get_", "list_", "generate_", "update_", "delete_", "detach_", "attach_")
-    for tree in HANDLER_TO_LAMBDA_LOGICAL_ID:
-        for path in (_REPO_ROOT / tree).rglob("*.py"):
-            source = ast.parse(path.read_text())
-            for node in ast.walk(source):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "get_paginator"
-                    and node.args
-                    and isinstance(node.args[0], ast.Constant)
-                    and isinstance(node.args[0].value, str)
-                ):
-                    method = node.args[0].value
-                    if method.startswith(iam_verbs) and method not in BOTO3_METHOD_TO_IAM_ACTION:
-                        unmapped.add(method)
-    assert not unmapped, f"unmapped IAM paginator methods: {sorted(unmapped)}"
+@pytest.mark.parametrize(
+    ("tree", "logical_id_prefix", "method_map"),
+    SCAN_TARGETS,
+    ids=[t[0] for t in SCAN_TARGETS],
+)
+def test_method_map_is_complete_for_each_tree(
+    tree: str, logical_id_prefix: str, method_map: dict[str, str]
+) -> None:
+    # An AWS-looking paginator method that isn't mapped would be silently ignored
+    # by the scanner — fail loudly so the map can't fall behind.
+    unmapped = {
+        method
+        for method in _paginator_strings_in(_REPO_ROOT / tree)
+        if method.startswith(_AWS_VERB_PREFIXES) and method not in method_map
+    }
+    assert not unmapped, f"unmapped paginator methods in {tree}: {sorted(unmapped)}"
