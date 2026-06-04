@@ -1,0 +1,373 @@
+schemaVersion: "0.3"
+description: >-
+  Tidewater: delete an unused Lambda function after snapshotting its code package
+  AND its full configuration to S3. Snapshot-before-delete is enforced by step
+  ordering. Three downstream-impact safety gates run before any snapshot/delete:
+  active event source mappings, a public function URL, or a resource policy
+  granting invoke to external sources each ABORT the automation (detector flags,
+  runbook protects).
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  FunctionName: { type: String, description: Name of the Lambda function to snapshot and delete. }
+  AccountId: { type: String, description: Account the function lives in (for resource-policy checks). }
+  SnapshotBucket: { type: String, description: S3 bucket for the code + config snapshot. }
+  AuditBucket: { type: String, description: S3 bucket for the JSONL audit trail. }
+  FindingsTableName: { type: String, description: DynamoDB findings table to mark resolved. }
+  FindingPk: { type: String, description: Finding partition key. }
+  FindingSk: { type: String, description: Finding sort key. }
+  EventBusName: { type: String, description: EventBridge bus for finding.remediated. }
+  AutomationAssumeRole: { type: String, description: Role this automation assumes. }
+mainSteps:
+  # --- Guardrail: never touch a platform-protected function name. ---
+  - name: assertFunctionNotProtected
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { FunctionName: "{{ FunctionName }}" }
+      Script: |
+        # Inline guardrail, mirroring the IAM runbooks (no external allowlist file
+        # exists in the repo). Protect platform/infrastructure-owned name prefixes.
+        PROTECTED_PREFIXES = ("aws-", "cdk-")
+        def _assert_not_protected(function_name):
+            if function_name.startswith(PROTECTED_PREFIXES):
+                raise Exception("Refusing to delete protected function: " + function_name)
+        def handler(events, context):
+            _assert_not_protected(events["FunctionName"])
+            return {"FunctionName": events["FunctionName"]}
+
+  # --- Read config + presigned code URL (read-only). ---
+  - name: getFunctionDetails
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { FunctionName: "{{ FunctionName }}" }
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            resp = boto3.client("lambda").get_function(FunctionName=events["FunctionName"])
+            return {
+                "ConfigJson": json.dumps(resp.get("Configuration", {}), default=str),
+                "TagsJson": json.dumps(resp.get("Tags", {})),
+                "CodeUrl": resp.get("Code", {}).get("Location", ""),
+            }
+    outputs:
+      - { Name: ConfigJson, Selector: $.Payload.ConfigJson, Type: String }
+      - { Name: TagsJson, Selector: $.Payload.TagsJson, Type: String }
+      - { Name: CodeUrl, Selector: $.Payload.CodeUrl, Type: String }
+
+  # --- SAFETY GATE 1: event-driven invocations. ---
+  - name: listEventSourceMappings
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { FunctionName: "{{ FunctionName }}" }
+      Script: |
+        import boto3, json
+        def _assert_no_mappings(mappings):
+            if mappings:
+                ids = [m.get("UUID") for m in mappings]
+                raise Exception(
+                    "Refusing to delete: function has %d active event source mappings: %s"
+                    % (len(mappings), ids)
+                )
+        def handler(events, context):
+            lam = boto3.client("lambda")
+            mappings = []
+            for page in lam.get_paginator("list_event_source_mappings").paginate(
+                FunctionName=events["FunctionName"]
+            ):
+                mappings.extend(page.get("EventSourceMappings", []))
+            _assert_no_mappings(mappings)
+            return {"MappingsJson": json.dumps(mappings, default=str)}
+    outputs:
+      - { Name: MappingsJson, Selector: $.Payload.MappingsJson, Type: String }
+
+  # --- SAFETY GATE 2: HTTP-driven invocations (function URL). ---
+  - name: getFunctionUrlConfig
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { FunctionName: "{{ FunctionName }}" }
+      Script: |
+        import boto3, json
+        from botocore.exceptions import ClientError
+        def _assert_no_url(url_config):
+            if url_config is not None:
+                raise Exception(
+                    "Refusing to delete: function has a public function URL with AuthType="
+                    + str(url_config.get("AuthType"))
+                )
+        def handler(events, context):
+            lam = boto3.client("lambda")
+            try:
+                cfg = lam.get_function_url_config(FunctionName=events["FunctionName"])
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                    return {"FunctionUrlJson": "null"}
+                raise
+            _assert_no_url({"AuthType": cfg.get("AuthType"), "FunctionUrl": cfg.get("FunctionUrl")})
+            return {"FunctionUrlJson": json.dumps(cfg, default=str)}
+    outputs:
+      - { Name: FunctionUrlJson, Selector: $.Payload.FunctionUrlJson, Type: String }
+
+  # --- SAFETY GATE 3: resource policy granting invoke to external sources. ---
+  - name: getResourcePolicy
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload: { FunctionName: "{{ FunctionName }}", AccountId: "{{ AccountId }}" }
+      Script: |
+        import boto3, json
+        from botocore.exceptions import ClientError
+        def _external_statements(policy_doc, account_id):
+            external = []
+            for st in policy_doc.get("Statement", []):
+                sid = st.get("Sid", "?")
+                principal = st.get("Principal", {})
+                if isinstance(principal, dict) and principal.get("Service"):
+                    # Internal only if a SourceAccount condition pins it to us.
+                    src = None
+                    for op in st.get("Condition", {}).values():
+                        if isinstance(op, dict):
+                            for key, val in op.items():
+                                if key.endswith("SourceAccount"):
+                                    src = val
+                    if src != account_id:
+                        external.append(sid)
+                    continue
+                aws = principal.get("AWS") if isinstance(principal, dict) else principal
+                aws_list = aws if isinstance(aws, list) else ([aws] if aws else [])
+                for arn in aws_list:
+                    if arn == "*":
+                        external.append(sid)
+                    elif isinstance(arn, str) and arn.count(":") >= 4:
+                        if arn.split(":")[4] != account_id:
+                            external.append(sid)
+            return external
+        def _assert_internal_only(policy_doc, account_id):
+            external = _external_statements(policy_doc, account_id)
+            if external:
+                raise Exception(
+                    "Refusing to delete: function has resource policy granting invoke to "
+                    "external sources: " + json.dumps(external)
+                )
+        def handler(events, context):
+            lam = boto3.client("lambda")
+            try:
+                resp = lam.get_policy(FunctionName=events["FunctionName"])
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                    return {"ResourcePolicyJson": "null"}
+                raise
+            policy_doc = json.loads(resp["Policy"])
+            _assert_internal_only(policy_doc, events["AccountId"])
+            return {"ResourcePolicyJson": json.dumps(policy_doc)}
+    outputs:
+      - { Name: ResourcePolicyJson, Selector: $.Payload.ResourcePolicyJson, Type: String }
+
+  # --- Build the restore-grade config snapshot + compute both S3 keys. ---
+  - name: buildSnapshot
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        FunctionName: "{{ FunctionName }}"
+        ConfigJson: "{{ getFunctionDetails.ConfigJson }}"
+        TagsJson: "{{ getFunctionDetails.TagsJson }}"
+        MappingsJson: "{{ listEventSourceMappings.MappingsJson }}"
+        FunctionUrlJson: "{{ getFunctionUrlConfig.FunctionUrlJson }}"
+        ResourcePolicyJson: "{{ getResourcePolicy.ResourcePolicyJson }}"
+        FindingPk: "{{ FindingPk }}"
+        FindingSk: "{{ FindingSk }}"
+      Script: |
+        import json, datetime
+        # Fields needed to recreate the function via lambda:CreateFunction.
+        _RESTORE_FIELDS = (
+            "FunctionName", "Runtime", "Role", "Handler", "Description", "Timeout",
+            "MemorySize", "Environment", "DeadLetterConfig", "TracingConfig", "Layers",
+            "VpcConfig", "FileSystemConfigs", "EphemeralStorage", "Architectures",
+            "KMSKeyArn", "PackageType", "ImageConfigResponse", "SnapStart",
+        )
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            stamp = now.strftime("%Y%m%dT%H%M%SZ")
+            config = json.loads(events["ConfigJson"])
+            restore = {k: config[k] for k in _RESTORE_FIELDS if k in config}
+            prefix = "lambda/function/" + events["FunctionName"] + "/" + stamp + "/"
+            snapshot = {
+                "function_config": config,
+                "restore_parameters": restore,
+                "tags": json.loads(events["TagsJson"]),
+                "event_source_mappings": json.loads(events["MappingsJson"]),
+                "function_url_config": json.loads(events["FunctionUrlJson"]),
+                "resource_policy": json.loads(events["ResourcePolicyJson"]),
+                "code_zip_s3_key": prefix + "code.zip",
+                "snapshot_metadata": {
+                    "snapshot_at": now.isoformat(),
+                    "taken_by": "TidewaterDeleteUnusedFunction",
+                    "finding_pk": events["FindingPk"],
+                    "finding_sk": events["FindingSk"],
+                },
+            }
+            return {
+                "SnapshotJson": json.dumps(snapshot, default=str),
+                "CodeKey": prefix + "code.zip",
+                "ConfigKey": prefix + "config.json",
+            }
+    outputs:
+      - { Name: SnapshotJson, Selector: $.Payload.SnapshotJson, Type: String }
+      - { Name: CodeKey, Selector: $.Payload.CodeKey, Type: String }
+      - { Name: ConfigKey, Selector: $.Payload.ConfigKey, Type: String }
+
+  # --- THE GATE (1/2): the code package must land in S3 before delete. ---
+  - name: downloadAndStoreCode
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Bucket: "{{ SnapshotBucket }}"
+        Key: "{{ buildSnapshot.CodeKey }}"
+        CodeUrl: "{{ getFunctionDetails.CodeUrl }}"
+      Script: |
+        import boto3, urllib.request
+        def handler(events, context):
+            with urllib.request.urlopen(events["CodeUrl"]) as resp:
+                body = resp.read()
+            boto3.client("s3").put_object(
+                Bucket=events["Bucket"], Key=events["Key"], Body=body,
+                ContentType="application/zip",
+            )
+            return {"CodeKey": events["Key"], "BytesWritten": len(body)}
+    outputs:
+      - { Name: CodeKey, Selector: $.Payload.CodeKey, Type: String }
+      - { Name: BytesWritten, Selector: $.Payload.BytesWritten, Type: Integer }
+
+  # --- THE GATE (2/2): the config snapshot must land in S3 before delete. ---
+  - name: writeSnapshotMetadata
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Bucket: "{{ SnapshotBucket }}"
+        Key: "{{ buildSnapshot.ConfigKey }}"
+        Body: "{{ buildSnapshot.SnapshotJson }}"
+      Script: |
+        import boto3
+        def handler(events, context):
+            boto3.client("s3").put_object(
+                Bucket=events["Bucket"], Key=events["Key"],
+                Body=events["Body"].encode(), ContentType="application/json",
+            )
+            return {"ConfigKey": events["Key"]}
+    outputs:
+      - { Name: ConfigKey, Selector: $.Payload.ConfigKey, Type: String }
+
+  # --- Delete (AFTER both snapshot objects are durable). The role is left intact. ---
+  - name: deleteFunction
+    action: aws:executeAwsApi
+    inputs:
+      Service: lambda
+      Api: DeleteFunction
+      FunctionName: "{{ FunctionName }}"
+
+  - name: updateFindingResolved
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        TableName: "{{ FindingsTableName }}"
+        Pk: "{{ FindingPk }}"
+        Sk: "{{ FindingSk }}"
+        CodeKey: "{{ buildSnapshot.CodeKey }}"
+        ConfigKey: "{{ buildSnapshot.ConfigKey }}"
+      Script: |
+        import boto3, datetime
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            boto3.client("dynamodb").update_item(
+                TableName=events["TableName"],
+                Key={"pk": {"S": events["Pk"]}, "sk": {"S": events["Sk"]}},
+                UpdateExpression="SET #s = :s, resolved_at = :r, snapshot_s3_key = :k, "
+                "snapshot_code_s3_key = :c",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":s": {"S": "resolved"},
+                    ":r": {"S": now},
+                    ":k": {"S": events["ConfigKey"]},
+                    ":c": {"S": events["CodeKey"]},
+                },
+            )
+            return {}
+
+  - name: emitRemediationCompletedEvent
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        EventBusName: "{{ EventBusName }}"
+        FunctionName: "{{ FunctionName }}"
+        FindingPk: "{{ FindingPk }}"
+        FindingSk: "{{ FindingSk }}"
+        ConfigKey: "{{ buildSnapshot.ConfigKey }}"
+      Script: |
+        import boto3, json
+        def handler(events, context):
+            boto3.client("events").put_events(Entries=[{
+                "Source": "tidewater.ssm_automation",
+                "DetailType": "finding.remediated",
+                "EventBusName": events["EventBusName"],
+                "Detail": json.dumps({
+                    "finding_pk": events["FindingPk"],
+                    "finding_sk": events["FindingSk"],
+                    "function_name": events["FunctionName"],
+                    "snapshot_s3_key": events["ConfigKey"],
+                }),
+            }])
+            return {}
+
+  - name: writeFinalAuditLog
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        AuditBucket: "{{ AuditBucket }}"
+        FunctionName: "{{ FunctionName }}"
+        FindingPk: "{{ FindingPk }}"
+        FindingSk: "{{ FindingSk }}"
+        CodeKey: "{{ buildSnapshot.CodeKey }}"
+        ConfigKey: "{{ buildSnapshot.ConfigKey }}"
+      Script: |
+        import boto3, json, datetime, random
+        def handler(events, context):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            audit_id = format(int(now.timestamp() * 1000), "x") + format(random.getrandbits(40), "010x")
+            record = {
+                "audit_id": audit_id,
+                "timestamp": now.isoformat(),
+                "event_type": "remediation_completed",
+                "finding_pk": events["FindingPk"],
+                "finding_sk": events["FindingSk"],
+                "rule_id": "lambda.unused_function",
+                "actor": "ssm_automation",
+                "details": {
+                    "function_name": events["FunctionName"],
+                    "snapshot_code_s3_key": events["CodeKey"],
+                },
+                "snapshot_s3_key": events["ConfigKey"],
+            }
+            key = "audit/" + now.strftime("%Y/%m/%d/%H") + "/" + audit_id + ".jsonl"
+            boto3.client("s3").put_object(
+                Bucket=events["AuditBucket"], Key=key, Body=(json.dumps(record) + "\n").encode()
+            )
+            return {"AuditKey": key}

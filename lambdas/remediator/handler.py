@@ -40,6 +40,7 @@ REGISTRY: dict[str, str] = {
     "iam.orphaned_trust": "TidewaterRemoveTrustPrincipalV2",
     "iam.unused_policy": "TidewaterDeleteUnusedPolicy",
     "iam.policy_quota": "TidewaterDetachUnusedPolicy",
+    "lambda.unused_function": "TidewaterDeleteUnusedFunction",
 }
 
 
@@ -82,12 +83,23 @@ def _params_detach_unused_policy(item: dict[str, Any]) -> dict[str, list[str]]:
     return {"RoleName": [str(item.get("details", {})["role_name"])]}
 
 
+def _params_unused_function(item: dict[str, Any]) -> dict[str, list[str]]:
+    # AccountId comes from the finding key (account#region#service) — the runbook
+    # uses it to tell same-account from external resource-policy principals.
+    account = str(item["pk"]).split("#", 1)[0]
+    return {
+        "FunctionName": [str(item.get("details", {})["function_name"])],
+        "AccountId": [account],
+    }
+
+
 PARAM_BUILDERS: dict[str, Callable[[dict[str, Any]], dict[str, list[str]]]] = {
     "iam.unused_role": _params_unused_role,
     "iam.stale_access_key": _params_stale_access_key,
     "iam.orphaned_trust": _params_orphaned_trust,
     "iam.unused_policy": _params_unused_policy,
     "iam.policy_quota": _params_detach_unused_policy,
+    "lambda.unused_function": _params_unused_function,
 }
 
 

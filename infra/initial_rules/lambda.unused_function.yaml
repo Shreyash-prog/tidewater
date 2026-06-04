@@ -1,0 +1,24 @@
+rule: lambda.unused_function
+enabled: true
+schedule: on-demand
+threshold:
+  # Platform engineer sets the idle-days threshold. The detector has NO default —
+  # the rule must specify it, or the detector raises (deliberate: avoid silently
+  # auto-remediating on an implicit window). For shorter demos, edit this value in
+  # the rules-yaml S3 bucket (same workflow as the Phase 5 demos).
+  idle_days: 7
+forecast:
+  enabled: false
+# POC default: 0 lets auto-remediation demo immediately. Production deployments
+# raise this to 14 (the Rule model default) so there is a grace window between
+# first detection and any auto-remediation.
+grace_period_days: 0
+policy:
+  default: prompt
+  overrides:
+    - match: { Environment: nonprod }
+      action: auto
+    - match: { tidewater-skip: "true" }
+      action: skip
+notifications:
+  channels: [eventbridge, sns]
