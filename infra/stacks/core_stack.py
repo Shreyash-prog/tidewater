@@ -81,6 +81,7 @@ EXTRA_SEED_RULES = [
     "iam.unused_policy",
     "iam.policy_quota",
     "lambda.unused_function",  # Phase 6
+    "iam.policy_quota.forecast_alert",  # Phase 7
 ]
 
 # Buckets whose removal policy is RETAIN (the audit trail must survive teardown).
@@ -144,6 +145,7 @@ class CoreStack(Stack):
             rules_bucket=buckets["rules-yaml"],
             findings_table=tables["findings"],
             rules_meta_table=tables["rules_meta"],
+            metric_history_table=tables["metric_history"],
             bus=bus,
         )
         lambda_detector_name = self._lambda_detector(
@@ -230,7 +232,9 @@ class CoreStack(Stack):
             sort_key=dynamodb.Attribute(name="requested_at", type=dynamodb.AttributeType.STRING),
         )
 
-        metric_history = table("MetricHistoryTable", "metric_name", "timestamp")
+        # pk = account#region#service#resource_arn, sk = ISO timestamp. Points
+        # expire via TTL (30 days) — ample for the 14-day forecast window.
+        metric_history = table("MetricHistoryTable", "pk", "sk", ttl_attribute="ttl")
         forecasts = table("ForecastsTable", "metric_name", "model_run")
         rules_meta = table("RulesMetaTable", "rule_id", "metadata")
 
@@ -614,6 +618,7 @@ class CoreStack(Stack):
         rules_bucket: s3.Bucket,
         findings_table: dynamodb.Table,
         rules_meta_table: dynamodb.Table,
+        metric_history_table: dynamodb.Table,
         bus: events.EventBus,
     ) -> str:
         # Failed (async) invocations land here for inspection (Phase 3 is on-demand).
@@ -636,6 +641,7 @@ class CoreStack(Stack):
             environment={
                 "RULES_BUCKET": rules_bucket.bucket_name,
                 "FINDINGS_TABLE": findings_table.table_name,
+                "METRIC_HISTORY_TABLE": metric_history_table.table_name,
                 "EVENT_BUS_NAME": bus.event_bus_name,
             },
             description="Detects idle IAM roles (iam.unused_role). On-demand in Phase 3.",
@@ -672,6 +678,9 @@ class CoreStack(Stack):
         findings_table.grant(
             fn, "dynamodb:BatchWriteItem", "dynamodb:UpdateItem", "dynamodb:GetItem"
         )
+        # Forecasting (iam.policy_quota): append a data point per scan (PutItem) and
+        # read a resource's history back (Query).
+        metric_history_table.grant(fn, "dynamodb:PutItem", "dynamodb:Query")
         bus.grant_put_events_to(fn)
 
         # Upload the rule YAML(s) to the bucket on every deploy.

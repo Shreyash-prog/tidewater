@@ -78,7 +78,15 @@ def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, int]:
             logger.info("unknown rule_id, skipping", extra={"rule_id": rule.rule_id})
             continue
         rules_run += 1
-        detector = detector_cls(account=account, region=region, threshold=rule.threshold)
+        # Surface the rule's forecast config to forecast-eligible detectors via the
+        # threshold dict (other detectors ignore the extra keys). The detector reads
+        # METRIC_HISTORY_TABLE from the environment for history reads/writes.
+        threshold = {
+            **rule.threshold,
+            "forecast_enabled": rule.forecast.enabled,
+            "alert_at_days_remaining": rule.forecast.alert_at_days_remaining,
+        }
+        detector = detector_cls(account=account, region=region, threshold=threshold)
         for finding in detector.run():
             finding.policy_decision = PolicyAction.DRY_RUN  # Phase 4 will decide for real
             findings.append(finding)

@@ -35,7 +35,7 @@ plugins = ["pydantic.mypy"]
 # Test sources are importable from the same roots used at runtime. infra/ is
 # deliberately absent so the `infra` package (not a bare dir) is what's imported.
 pythonpath = ["lambdas", "."]
-testpaths = ["tests", "lambdas/tests", "infra/tests"]
+testpaths = ["tests", "lambdas/tests", "infra/tests", "tools/tests"]
 # Smoke tests need real AWS credentials and a deployed stack — excluded from the
 # default run; `make smoke` selects them explicitly.
 # importlib mode lets same-named test modules (e.g. several test_handler.py)

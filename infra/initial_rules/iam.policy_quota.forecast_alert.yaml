@@ -1,0 +1,22 @@
+rule: iam.policy_quota.forecast_alert
+enabled: true
+schedule: on-demand
+threshold:
+  # alert_at_days_remaining lives in the PARENT rule (iam.policy_quota.yaml). This
+  # rule has no thresholds of its own — the parent detector emits it when its
+  # forecast projects a breach within that many days.
+  enabled: true
+forecast:
+  enabled: false # this rule doesn't itself produce forecasts
+grace_period_days: 0
+policy:
+  # Forecasts are ALWAYS prompt-default and NEVER auto-remediated: we will not
+  # delete a policy based on a *projection* of what might happen. Real breaches
+  # (iam.policy_quota) can auto-remediate; predicted ones get human review.
+  # Notably there is NO Environment=nonprod -> auto override here.
+  default: prompt
+  overrides:
+    - match: { tidewater-skip: "true" }
+      action: skip
+notifications:
+  channels: [eventbridge, sns]

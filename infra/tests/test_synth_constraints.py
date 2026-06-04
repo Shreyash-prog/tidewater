@@ -248,3 +248,31 @@ def test_policy_engine_can_getitem_on_approvals_table(resources: dict[str, dict]
     role_id = _role_id_for_function(resources, functions[0])
     actions = _actions_on_table(resources, role_id, "ApprovalsTable")
     assert "dynamodb:GetItem" in actions, f"policy engine lacks GetItem on approvals: {actions}"
+
+
+def test_metric_history_table_has_ttl(resources: dict[str, dict]) -> None:
+    # Forecasting data points expire via DynamoDB TTL (30 days).
+    tables = {
+        name: t
+        for name, t in _of_type(resources, "AWS::DynamoDB::Table").items()
+        if name.startswith("MetricHistoryTable")
+    }
+    assert len(tables) == 1, tables
+    (props,) = (t["Properties"] for t in tables.values())
+    ttl = props.get("TimeToLiveSpecification", {})
+    assert ttl.get("Enabled") is True and ttl.get("AttributeName") == "ttl", ttl
+
+
+def test_iam_detector_can_write_and_read_metric_history(resources: dict[str, dict]) -> None:
+    # Forecasting: the IAM detector appends points (PutItem) and reads history (Query).
+    functions = [
+        name
+        for name in _of_type(resources, "AWS::Lambda::Function")
+        if name.startswith("IamDetectorFunction")
+    ]
+    assert len(functions) == 1, functions
+    role_id = _role_id_for_function(resources, functions[0])
+    actions = _actions_on_table(resources, role_id, "MetricHistoryTable")
+    assert {"dynamodb:PutItem", "dynamodb:Query"} <= actions, (
+        f"IAM detector lacks metric_history PutItem/Query: {sorted(actions)}"
+    )

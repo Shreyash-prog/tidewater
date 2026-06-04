@@ -10,6 +10,7 @@ requires.
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import boto3
@@ -53,6 +54,23 @@ class WriteResult:
     @property
     def count(self) -> int:
         return len(self.created) + len(self.updated)
+
+
+def _decimalize(value: Any) -> Any:
+    """Recursively convert floats to Decimal — the DynamoDB resource rejects floats.
+
+    Most finding details are ints/strings, but forecast findings carry float
+    fields (rate_per_day, days_to_breach, r_squared). bools are left as-is.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {k: _decimalize(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decimalize(v) for v in value]
+    return value
 
 
 def finding_pk(finding: Finding) -> str:
@@ -100,7 +118,7 @@ class FindingsTableWriter:
         ]
         for i, attr in enumerate(_LOOPED_ATTRS):
             names[f"#a{i}"] = attr
-            values[f":a{i}"] = payload[attr]
+            values[f":a{i}"] = _decimalize(payload[attr])
             set_parts.append(f"#a{i} = :a{i}")
 
         params: dict[str, Any] = {

@@ -12,7 +12,7 @@ RUFF := $(VENV)/bin/ruff
 MYPY := $(VENV)/bin/mypy
 PYTEST := $(VENV)/bin/pytest
 DASHBOARD := dashboard
-PY_SRC := lambdas infra tests
+PY_SRC := lambdas infra tests tools
 
 # Quiet the jsii Node-version deprecation banner during synth.
 export JSII_SILENCE_WARNING_DEPRECATED_NODE_VERSION := 1
