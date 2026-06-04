@@ -200,6 +200,18 @@ class CoreStack(Stack):
             partition_key=dynamodb.Attribute(name="status", type=dynamodb.AttributeType.STRING),
             sort_key=dynamodb.Attribute(name="detected_at", type=dynamodb.AttributeType.STRING),
         )
+        # Per-resource in-flight lookup: the policy engine checks whether any other
+        # finding for the same resource_arn is already in_remediation before it
+        # dispatches an auto remediation, so two rules flagging one resource don't
+        # remediate it concurrently. O(1) index query instead of a table scan.
+        findings.add_global_secondary_index(
+            index_name="ResourceArnStatusIndex",
+            partition_key=dynamodb.Attribute(
+                name="resource_arn", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(name="status", type=dynamodb.AttributeType.STRING),
+            projection_type=dynamodb.ProjectionType.ALL,
+        )
 
         approvals = table("ApprovalsTable", "approval_id", "metadata")
         approvals.add_global_secondary_index(
@@ -909,7 +921,10 @@ class CoreStack(Stack):
             description="Decides auto/prompt/dry_run/skip per finding (DynamoDB Streams).",
         )
         pfn = policy_engine.function
-        findings_table.grant(pfn, "dynamodb:GetItem", "dynamodb:UpdateItem")
+        # Query is needed for the per-resource in-flight conflict check against the
+        # ResourceArnStatusIndex GSI; Table.grant also covers the table's /index/*
+        # ARNs, so the GSI is included.
+        findings_table.grant(pfn, "dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query")
         # GetItem is needed for the idempotency check in _ensure_approval.
         approvals_table.grant(pfn, "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem")
         rules_bucket.grant_read(pfn)

@@ -46,6 +46,7 @@ processor = BatchProcessor(event_type=EventType.DynamoDBStreams)
 SOURCE = "tidewater.policy_engine"
 ACTOR = "policy_engine"
 _PROCESSABLE = (DynamoDBRecordEventName.INSERT, DynamoDBRecordEventName.MODIFY)
+RESOURCE_ARN_STATUS_INDEX = "ResourceArnStatusIndex"
 
 
 def _findings_table() -> Any:
@@ -96,6 +97,32 @@ def _write_decision(pk: str, sk: str, decision: PolicyAction, reason: str) -> No
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=values,
     )
+
+
+def _check_concurrent_remediation(
+    resource_arn: str, current_finding_sk: str
+) -> dict[str, Any] | None:
+    """Return another finding currently in-flight for the same resource, or None.
+
+    Multiple rules can flag one resource_arn; if a remediation is already running
+    for it we must not dispatch a second runbook concurrently (the faster one
+    could delete/mutate the resource out from under the slower, half-completing
+    it). A finding never conflicts with itself, so the current finding's own
+    in_remediation row is excluded.
+    """
+    resp = _findings_table().query(
+        IndexName=RESOURCE_ARN_STATUS_INDEX,
+        KeyConditionExpression="resource_arn = :arn AND #st = :status",
+        ExpressionAttributeNames={"#st": "status"},
+        ExpressionAttributeValues={
+            ":arn": resource_arn,
+            ":status": FindingStatus.IN_REMEDIATION.value,
+        },
+    )
+    for item in resp.get("Items", []):
+        if item.get("sk") != current_finding_sk:
+            return item
+    return None
 
 
 def _invoke_remediator(pk: str, sk: str, rule_id: str) -> None:
@@ -169,6 +196,35 @@ def _ensure_approval(finding: Finding, pk: str, sk: str) -> None:
 
 def _dispatch(decision: PolicyAction, finding: Finding, pk: str, sk: str) -> None:
     if decision is PolicyAction.AUTO:
+        conflict = _check_concurrent_remediation(
+            resource_arn=finding.resource_arn, current_finding_sk=sk
+        )
+        if conflict is not None:
+            logger.info(
+                "deferring dispatch — concurrent remediation in-flight for same resource",
+                extra={
+                    "finding_sk": sk,
+                    "conflict_rule_id": conflict.get("rule_id"),
+                    "conflict_sk": conflict.get("sk"),
+                },
+            )
+            write_audit_event(
+                event_type="dispatch_deferred",
+                finding_pk=pk,
+                finding_sk=sk,
+                rule_id=finding.rule_id,
+                resource_arn=finding.resource_arn,
+                actor=ACTOR,
+                details={
+                    "reason": "concurrent_remediation_in_flight",
+                    "conflict_rule_id": conflict.get("rule_id"),
+                    "conflict_finding_sk": conflict.get("sk"),
+                },
+            )
+            # Leave the finding open with its auto decision. It re-evaluates (and
+            # re-checks for conflicts) on the next stream event for it — in the POC,
+            # the next detector run, which re-upserts and bumps last_seen_at.
+            return
         _invoke_remediator(pk, sk, finding.rule_id)
         logger.info("dispatched auto-remediation", extra={"finding_sk": sk})
     elif decision is PolicyAction.PROMPT:

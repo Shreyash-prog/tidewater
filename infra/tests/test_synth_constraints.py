@@ -75,6 +75,38 @@ def test_findings_table_has_a_stream(resources: dict[str, dict]) -> None:
     assert len(streamed) == 1 and streamed[0].startswith("FindingsTable")
 
 
+def test_findings_table_has_resource_arn_status_index(resources: dict[str, dict]) -> None:
+    # The policy engine's per-resource in-flight check queries this GSI; it must
+    # exist with resource_arn (HASH) + status (RANGE).
+    findings = {
+        name: t
+        for name, t in _of_type(resources, "AWS::DynamoDB::Table").items()
+        if name.startswith("FindingsTable")
+    }
+    assert len(findings) == 1
+    (table,) = findings.values()
+    gsis = {g["IndexName"]: g for g in table["Properties"].get("GlobalSecondaryIndexes", [])}
+    assert "ResourceArnStatusIndex" in gsis, f"missing GSI; have {sorted(gsis)}"
+    key_schema = {
+        k["KeyType"]: k["AttributeName"] for k in gsis["ResourceArnStatusIndex"]["KeySchema"]
+    }
+    assert key_schema == {"HASH": "resource_arn", "RANGE": "status"}
+
+
+def test_policy_engine_can_query_findings_index(resources: dict[str, dict]) -> None:
+    # The in-flight check is a Query against the GSI; without dynamodb:Query the
+    # check fails closed at runtime (the exact drift the boto3<->IAM audit guards).
+    functions = [
+        name
+        for name in _of_type(resources, "AWS::Lambda::Function")
+        if name.startswith("PolicyEngineFunction")
+    ]
+    assert len(functions) == 1, functions
+    role_id = _role_id_for_function(resources, functions[0])
+    actions = _actions_granted_to_role(resources, role_id)
+    assert "dynamodb:Query" in actions, f"policy engine lacks Query: {sorted(actions)}"
+
+
 def _statements_with_action(resources: dict[str, dict], action: str) -> list[dict]:
     statements: list[dict] = []
     for policy in _of_type(resources, "AWS::IAM::Policy").values():

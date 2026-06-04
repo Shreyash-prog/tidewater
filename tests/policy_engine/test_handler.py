@@ -165,10 +165,22 @@ def _make_findings_table() -> None:
         AttributeDefinitions=[
             {"AttributeName": "pk", "AttributeType": "S"},
             {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "resource_arn", "AttributeType": "S"},
+            {"AttributeName": "status", "AttributeType": "S"},
         ],
         KeySchema=[
             {"AttributeName": "pk", "KeyType": "HASH"},
             {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "ResourceArnStatusIndex",
+                "KeySchema": [
+                    {"AttributeName": "resource_arn", "KeyType": "HASH"},
+                    {"AttributeName": "status", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
         ],
     )
 
@@ -277,3 +289,114 @@ def test_reevaluation_of_unchanged_prompt_ensures_single_approval(aws: Any) -> N
     # invoked for a prompt decision.
     assert aws.approvals.scan()["Count"] == 1
     assert pe._invoke_remediator.calls == []
+
+
+# ----------------------------------------- multi-rule per-resource race (deferred dispatch)
+def _put(
+    table: Any,
+    *,
+    sk: str,
+    rule_id: str,
+    status: str = "open",
+    decision: str = "auto",
+    tags: dict[str, str] | None = None,
+    resource_arn: str = ARN,
+) -> dict[str, Any]:
+    now = datetime.now(UTC).isoformat()
+    item = {
+        "pk": PK,
+        "sk": sk,
+        "account": "111",
+        "region": REGION,
+        "service": "iam",
+        "resource_arn": resource_arn,
+        "rule_id": rule_id,
+        "status": status,
+        "severity": "high",
+        "detected_at": now,
+        "last_seen_at": now,
+        "details": {"role_name": "r", "tags": tags or {}},
+        "policy_decision": decision,
+    }
+    table.put_item(Item=item)
+    return item
+
+
+def _seed_extra_rule(rule_id: str) -> None:
+    # Reuse the unused_role YAML shape (nonprod -> auto) under a different rule id.
+    body = RULE_YAML.replace("iam.unused_role", rule_id)
+    boto3.client("s3", region_name=REGION).put_object(
+        Bucket=RULES_BUCKET, Key=f"rules/{rule_id}.yaml", Body=body.encode()
+    )
+    rule_loader.clear_cache()
+
+
+def _deferred_audits() -> list[Any]:
+    return [c for c in pe.write_audit_event.calls if c[1].get("event_type") == "dispatch_deferred"]
+
+
+def test_defers_dispatch_when_concurrent_remediation_in_flight(aws: Any) -> None:
+    # A different rule is already remediating the same resource.
+    _put(
+        aws.findings,
+        sk=f"{ARN}#iam.orphaned_trust",
+        rule_id="iam.orphaned_trust",
+        status="in_remediation",
+    )
+    target = _put(aws.findings, sk=SK, rule_id="iam.unused_role", tags={"Environment": "nonprod"})
+    pe.handler(_stream_event(target, event_name="MODIFY"), _context())
+
+    assert pe._invoke_remediator.calls == []  # dispatch deferred, not invoked
+    deferred = _deferred_audits()
+    assert len(deferred) == 1
+    assert deferred[0][1]["resource_arn"] == ARN
+    assert deferred[0][1]["details"]["conflict_rule_id"] == "iam.orphaned_trust"
+    # Finding stays open with its auto decision (no new status value).
+    finding = aws.findings.get_item(Key={"pk": PK, "sk": SK})["Item"]
+    assert finding["status"] == FindingStatus.OPEN.value
+    assert finding["policy_decision"] == "auto"
+
+
+def test_dispatches_when_no_concurrent_remediation(aws: Any) -> None:
+    target = _put(aws.findings, sk=SK, rule_id="iam.unused_role", tags={"Environment": "nonprod"})
+    pe.handler(_stream_event(target, event_name="MODIFY"), _context())
+
+    assert pe._invoke_remediator.calls == [((PK, SK, "iam.unused_role"), {})]
+    assert _deferred_audits() == []
+
+
+def test_finding_does_not_defer_to_itself(aws: Any) -> None:
+    # The only in_remediation row for the resource is the finding itself — a
+    # re-fired event must not see that as a conflict.
+    _put(
+        aws.findings,
+        sk=SK,
+        rule_id="iam.unused_role",
+        status="in_remediation",
+        tags={"Environment": "nonprod"},
+    )
+    assert pe._check_concurrent_remediation(resource_arn=ARN, current_finding_sk=SK) is None
+
+
+def test_multiple_siblings_all_defer(aws: Any) -> None:
+    _seed_extra_rule("iam.policy_quota")
+    # One rule already in-flight for the resource.
+    _put(
+        aws.findings,
+        sk=f"{ARN}#iam.orphaned_trust",
+        rule_id="iam.orphaned_trust",
+        status="in_remediation",
+    )
+    # Two auto findings for the same resource both come up for dispatch.
+    first = _put(aws.findings, sk=SK, rule_id="iam.unused_role", tags={"Environment": "nonprod"})
+    second = _put(
+        aws.findings,
+        sk=f"{ARN}#iam.policy_quota",
+        rule_id="iam.policy_quota",
+        tags={"Environment": "nonprod"},
+    )
+    pe.handler(_stream_event(first, event_name="MODIFY"), _context())
+    pe.handler(_stream_event(second, event_name="MODIFY"), _context())
+
+    assert pe._invoke_remediator.calls == []
+    assert len(_deferred_audits()) == 2

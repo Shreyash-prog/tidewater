@@ -19,6 +19,7 @@ logger = Logger(child=True)
 
 AuditEventType = Literal[
     "policy_decided",
+    "dispatch_deferred",
     "remediation_started",
     "remediation_completed",
     "remediation_failed",
