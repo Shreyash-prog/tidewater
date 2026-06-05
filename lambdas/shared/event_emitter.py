@@ -1,7 +1,9 @@
 """Emit events to the tidewater-events EventBridge bus.
 
-The Phase 2 rule on the bus forwards everything with a `tidewater.*` source to the
-SNS notifications topic, so emitting here is what surfaces activity downstream.
+Downstream consumers subscribe via rules on the bus. Notably the Phase 8
+NotifierFunction matches finding + remediation-failure events (by detail-type),
+filters to the notification-worthy ones, and emails via SNS. (Phase 2's raw
+`tidewater.* -> SNS` fan-out rule was replaced by that notifier.)
 """
 
 import json

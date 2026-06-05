@@ -157,6 +157,7 @@ def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, Any]:
     # Defense in depth: never remediate a protected role, even if asked to.
     if is_protected_role(resource_arn):
         logger.error("refusing to remediate protected role", extra={"resource_arn": resource_arn})
+        reason = "protected role — remediation refused"
         write_audit_event(
             event_type="remediation_failed",
             finding_pk=pk,
@@ -164,7 +165,19 @@ def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, Any]:
             rule_id=rule_id,
             resource_arn=resource_arn,
             actor=ACTOR,
-            details={"reason": "protected role — remediation refused"},
+            details={"reason": reason},
+        )
+        # Surface the failure for notification (the notifier emails on these).
+        emit_event(
+            "remediation.failed",
+            {
+                "finding_pk": pk,
+                "finding_sk": sk,
+                "rule_id": rule_id,
+                "resource_arn": resource_arn,
+                "reason": reason,
+            },
+            source=SOURCE,
         )
         return {"status": "refused_protected", "resource_arn": resource_arn}
 
