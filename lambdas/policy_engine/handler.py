@@ -269,6 +269,11 @@ def _process(record: DynamoDBRecord) -> None:
             actor=ACTOR,
             details={"decision": decision.value, "reason": reason},
         )
+        # Re-emit the finding with its DECIDED policy_decision so the notifier sees
+        # the post-decision state (the detector's original event carried dry_run).
+        # The notifier owns notification filtering; we just surface the decision.
+        finding.policy_decision = decision
+        emit_event("Finding.updated", finding.model_dump(mode="json"), source=SOURCE)
         logger.info("policy decided", extra={"finding_sk": sk, "decision": decision.value})
 
     # Always dispatch — downstream ops (_ensure_approval, _invoke_remediator,

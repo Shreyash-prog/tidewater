@@ -254,7 +254,10 @@ def test_prompt_path_creates_approval(aws: Any) -> None:
     assert len(approvals) == 1
     assert approvals[0]["finding_sk"] == SK
     assert approvals[0]["status"] == "pending"
-    assert pe.emit_event.calls and pe.emit_event.calls[0][0][0] == "approval.requested"
+    emitted = [c[0][0] for c in pe.emit_event.calls]
+    assert "approval.requested" in emitted
+    # The decided finding is re-emitted (with policy_decision=prompt) for the notifier.
+    assert "Finding.updated" in emitted
     finding = aws.findings.get_item(Key={"pk": PK, "sk": SK})["Item"]
     assert finding["policy_decision"] == "prompt"
 
@@ -276,7 +279,7 @@ def test_skip_path_marks_finding_skipped(aws: Any) -> None:
     finding = aws.findings.get_item(Key={"pk": PK, "sk": SK})["Item"]
     assert finding["policy_decision"] == "skip"
     assert finding["status"] == FindingStatus.SKIPPED.value
-    assert pe.emit_event.calls[0][0][0] == "finding.skipped"
+    assert "finding.skipped" in [c[0][0] for c in pe.emit_event.calls]
 
 
 def test_reevaluation_of_unchanged_prompt_ensures_single_approval(aws: Any) -> None:

@@ -276,3 +276,53 @@ def test_iam_detector_can_write_and_read_metric_history(resources: dict[str, dic
     assert {"dynamodb:PutItem", "dynamodb:Query"} <= actions, (
         f"IAM detector lacks metric_history PutItem/Query: {sorted(actions)}"
     )
+
+
+def _notifier_function(resources: dict[str, dict]) -> tuple[str, dict]:
+    fns = {
+        name: v
+        for name, v in _of_type(resources, "AWS::Lambda::Function").items()
+        if name.startswith("NotifierFunction")
+    }
+    assert len(fns) == 1, fns
+    ((name, v),) = fns.items()
+    return name, v
+
+
+def test_notifier_function_exists(resources: dict[str, dict]) -> None:
+    _name, fn = _notifier_function(resources)
+    props = fn["Properties"]
+    assert props["Runtime"] == "python3.12"
+    assert props["MemorySize"] == 256
+    assert props["Timeout"] == 30
+
+
+def test_notifier_eventbridge_rule_pattern(resources: dict[str, dict]) -> None:
+    rules = {
+        name: v
+        for name, v in _of_type(resources, "AWS::Events::Rule").items()
+        if v["Properties"].get("Name") == "tidewater-notifier-rule"
+    }
+    assert len(rules) == 1, rules
+    (props,) = (v["Properties"] for v in rules.values())
+    assert set(props["EventPattern"]["detail-type"]) == {
+        "Finding.created",
+        "Finding.updated",
+        "remediation.failed",
+    }
+
+
+def test_notifier_can_publish_to_sns(resources: dict[str, dict]) -> None:
+    name, _ = _notifier_function(resources)
+    role_id = _role_id_for_function(resources, name)
+    actions = _actions_granted_to_role(resources, role_id)
+    assert "sns:Publish" in actions, f"notifier lacks sns:Publish: {sorted(actions)}"
+
+
+def test_notifier_can_claim_notification_slot(resources: dict[str, dict]) -> None:
+    name, _ = _notifier_function(resources)
+    role_id = _role_id_for_function(resources, name)
+    actions = _actions_on_table(resources, role_id, "FindingsTable")
+    assert "dynamodb:UpdateItem" in actions, (
+        f"notifier lacks findings UpdateItem: {sorted(actions)}"
+    )

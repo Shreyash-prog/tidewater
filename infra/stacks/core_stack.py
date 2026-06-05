@@ -8,13 +8,12 @@ dashboard. Detector/policy/remediator logic comes in later phases.
 """
 
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import yaml
 from aws_cdk import (
     CfnOutput,
     CfnParameter,
-    CfnResource,
     CustomResource,
     Duration,
     RemovalPolicy,
@@ -161,6 +160,11 @@ class CoreStack(Stack):
             audit_bucket=buckets["audit-log"],
             bus=bus,
         )
+        notifier_name = self._notifier(
+            findings_table=tables["findings"],
+            notifications_topic=notifications_topic,
+            bus=bus,
+        )
 
         self._outputs(
             tables=tables,
@@ -170,6 +174,7 @@ class CoreStack(Stack):
             bus=bus,
             notifications_topic=notifications_topic,
             deploy_version=deploy_version,
+            notifier_name=notifier_name,
             iam_detector_name=iam_detector_name,
             lambda_detector_name=lambda_detector_name,
             policy_engine_name=policy_engine_name,
@@ -386,23 +391,59 @@ class CoreStack(Stack):
     # ------------------------------------------------------------------ EventBridge
     def _eventbridge(self, notifications_topic: sns.Topic) -> events.EventBus:
         bus = events.EventBus(self, "EventBus", event_bus_name="tidewater-events")
-
         scheduler.CfnScheduleGroup(self, "DetectorScheduleGroup", name="tidewater-detectors")
+        # Phase 8 replaced the Phase 2 raw "tidewater.* -> SNS" fan-out rule with the
+        # NotifierFunction (see _notifier): the notifier is the SOLE publisher to the
+        # notifications topic, so subscribers get filtered, deduped, formatted emails
+        # instead of raw event JSON for every event.
+        return bus
 
+    # ------------------------------------------------------------------ Notifier
+    def _notifier(
+        self,
+        *,
+        findings_table: dynamodb.Table,
+        notifications_topic: sns.Topic,
+        bus: events.EventBus,
+    ) -> str:
+        dlq = sqs.Queue(
+            self, "NotifierDlq", queue_name="notifier-dlq", retention_period=Duration.days(14)
+        )
+        notifier = PythonLambda(
+            self,
+            "Notifier",
+            entry="lambdas/notifier",
+            handler="notifier.handler.handler",
+            include_shared=True,
+            memory_size=256,
+            timeout=Duration.seconds(30),
+            dead_letter_queue=dlq,
+            environment={
+                "NOTIFICATIONS_TOPIC_ARN": notifications_topic.topic_arn,
+                "FINDINGS_TABLE": findings_table.table_name,
+                "STALENESS_DAYS": "7",
+            },
+            description="Filters + dedupes notification-worthy events and emails via SNS.",
+        )
+        fn = notifier.function
+        notifications_topic.grant_publish(fn)
+        # Claims the per-finding notification slot (sets `notified_at`).
+        findings_table.grant(fn, "dynamodb:UpdateItem")
+
+        # The rule is more permissive than what we actually email on (severity +
+        # decision are filtered in the Lambda); EventBridge can't express that logic.
         rule = events.Rule(
             self,
-            "TidewaterEventsToSns",
+            "NotifierRule",
+            rule_name="tidewater-notifier-rule",
             event_bus=bus,
-            description="Fan out all tidewater.* events to the notifications topic.",
-            # Placeholder pattern; overridden below with a source-prefix match
-            # (CDK's L2 EventPattern doesn't expose prefix matching on scalar fields).
-            event_pattern=events.EventPattern(source=["tidewater.placeholder"]),
+            description="Route finding + remediation-failure events to the notifier.",
+            event_pattern=events.EventPattern(
+                detail_type=["Finding.created", "Finding.updated", "remediation.failed"]
+            ),
         )
-        rule.add_target(targets.SnsTopic(notifications_topic))
-        cfn_rule = cast(CfnResource, rule.node.default_child)
-        cfn_rule.add_property_override("EventPattern", {"source": [{"prefix": "tidewater."}]})
-
-        return bus
+        rule.add_target(targets.LambdaFunction(fn))
+        return fn.function_name
 
     # ------------------------------------------------------------------ API + Lambdas
     def _api(self, distribution: cloudfront.Distribution, deploy_version: CfnParameter) -> str:
@@ -1057,12 +1098,14 @@ class CoreStack(Stack):
         lambda_detector_name: str,
         policy_engine_name: str,
         remediator_name: str,
+        notifier_name: str,
     ) -> None:
         outputs: dict[str, str] = {
             "IamDetectorLambdaName": iam_detector_name,
             "LambdaDetectorLambdaName": lambda_detector_name,
             "PolicyEngineLambdaName": policy_engine_name,
             "RemediatorLambdaName": remediator_name,
+            "NotifierLambdaName": notifier_name,
             "SsmDocumentName": DELETE_IAM_ROLE_DOC_NAME,
             "DashboardUrl": f"https://{distribution.distribution_domain_name}",
             "ApiUrl": api_url,
