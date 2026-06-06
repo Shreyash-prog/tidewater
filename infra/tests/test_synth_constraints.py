@@ -326,3 +326,88 @@ def test_notifier_can_claim_notification_slot(resources: dict[str, dict]) -> Non
     assert "dynamodb:UpdateItem" in actions, (
         f"notifier lacks findings UpdateItem: {sorted(actions)}"
     )
+
+
+# ------------------------------------------------------------------ Phase 9a dashboard
+def _single_function(resources: dict[str, dict], prefix: str) -> tuple[str, dict]:
+    fns = {
+        name: v
+        for name, v in _of_type(resources, "AWS::Lambda::Function").items()
+        if name.startswith(prefix)
+    }
+    assert len(fns) == 1, f"expected one {prefix}; got {sorted(fns)}"
+    ((name, v),) = fns.items()
+    return name, v
+
+
+def test_dashboard_api_function_exists(resources: dict[str, dict]) -> None:
+    _name, fn = _single_function(resources, "DashboardApiFunction")
+    props = fn["Properties"]
+    assert props["Runtime"] == "python3.12"
+    assert props["MemorySize"] == 512
+    assert props["Timeout"] == 30
+
+
+def test_authorizer_function_exists(resources: dict[str, dict]) -> None:
+    # The HTTP API bearer authorizer (reused/upgraded from the Phase 2 stub).
+    _single_function(resources, "AuthorizerFunction")
+
+
+def test_six_dashboard_routes_target_the_api_lambda(resources: dict[str, dict]) -> None:
+    expected = {
+        "GET /findings",
+        "GET /findings/{pk}/{sk}",
+        "GET /findings/{pk}/{sk}/audit",
+        "GET /findings/{pk}/{sk}/snapshot",
+        "GET /rules",
+        "GET /rules/{rule_id}",
+    }
+    routes = {
+        v["Properties"]["RouteKey"]
+        for v in _of_type(resources, "AWS::ApiGatewayV2::Route").values()
+    }
+    assert expected <= routes, f"missing routes: {sorted(expected - routes)}"
+    # All six use the custom (bearer) authorizer; /health stays public.
+    for v in _of_type(resources, "AWS::ApiGatewayV2::Route").values():
+        rk = v["Properties"]["RouteKey"]
+        if rk in expected:
+            assert v["Properties"].get("AuthorizationType") == "CUSTOM", rk
+        if rk == "GET /health":
+            assert v["Properties"].get("AuthorizationType") == "NONE"
+
+
+def test_bearer_token_parameter_custom_resource(resources: dict[str, dict]) -> None:
+    bearer = _of_type(resources, "Custom::BearerToken")
+    assert len(bearer) == 1
+    (cr,) = bearer.values()
+    assert cr["Properties"]["ParameterName"] == "/platform-hygiene/poc/bearer-token"
+    assert cr["Properties"]["ParameterType"] == "SecureString"
+
+
+def test_dashboard_api_can_read_findings(resources: dict[str, dict]) -> None:
+    name, _ = _single_function(resources, "DashboardApiFunction")
+    role_id = _role_id_for_function(resources, name)
+    actions = _actions_on_table(resources, role_id, "FindingsTable")
+    assert {"dynamodb:Scan", "dynamodb:GetItem"} <= actions, (
+        f"dashboard API lacks findings Scan/GetItem: {sorted(actions)}"
+    )
+
+
+def test_dashboard_api_can_read_buckets(resources: dict[str, dict]) -> None:
+    name, _ = _single_function(resources, "DashboardApiFunction")
+    role_id = _role_id_for_function(resources, name)
+    actions = _actions_granted_to_role(resources, role_id)
+    # grant_read yields s3:GetObject* / s3:List* (wildcard form).
+    assert any(a.startswith("s3:GetObject") for a in actions), (
+        f"dashboard API lacks s3:GetObject: {sorted(actions)}"
+    )
+    assert any(a.startswith("s3:List") for a in actions), (
+        f"dashboard API lacks s3:List: {sorted(actions)}"
+    )
+
+
+def test_authorizer_can_read_bearer_token(resources: dict[str, dict]) -> None:
+    name, _ = _single_function(resources, "AuthorizerFunction")
+    role_id = _role_id_for_function(resources, name)
+    actions = _actions_granted_to_role(resources, role_id)
+    assert "ssm:GetParameter" in actions, f"authorizer lacks ssm:GetParameter: {sorted(actions)}"

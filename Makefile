@@ -76,8 +76,12 @@ refresh-powertools: ## Re-resolve the Powertools layer version into cdk.context.
 	PATH="$(CURDIR)/$(VENV)/bin:$$PATH" cdk synth > /dev/null
 	@echo "Powertools layer version refreshed in cdk.context.json — commit the change."
 
+.PHONY: build-frontend
+build-frontend: ## Build the dashboard SPA into dashboard/dist (synced to S3 on deploy)
+	cd $(DASHBOARD) && npm run build
+
 .PHONY: deploy
-deploy: ## Deploy CoreStack (assumes OidcStack already bootstrapped — see README)
+deploy: build-frontend ## Build the SPA, then deploy CoreStack (syncs dist to S3 + invalidates CloudFront)
 	PATH="$(CURDIR)/$(VENV)/bin:$$PATH" cdk deploy PlatformHygiene-Core --require-approval never
 
 .PHONY: deploy-oidc
