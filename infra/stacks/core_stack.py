@@ -7,6 +7,7 @@ topics, an HTTP API with a single /health route, the bearer-token SSM parameter
 dashboard. Detector/policy/remediator logic comes in later phases.
 """
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -365,21 +366,8 @@ class CoreStack(Stack):
             ],
         )
 
-        # Deploy the built SPA when present; otherwise keep a placeholder page.
-        # Both forms invalidate the CloudFront cache so a deploy is visible at once.
-        if DASHBOARD_DIST_DIR.is_dir():
-            sources = [s3deploy.Source.asset(str(DASHBOARD_DIST_DIR))]
-        else:
-            sources = [s3deploy.Source.data("index.html", PLACEHOLDER_HTML)]
-        s3deploy.BucketDeployment(
-            self,
-            "DashboardDeployment",
-            sources=sources,
-            destination_bucket=dashboard_bucket,
-            distribution=distribution,
-            distribution_paths=["/*"],
-        )
-
+        # The SPA bucket deployment (assets + runtime /config.json) is created in
+        # _api(), where the HTTP API URL that config.json needs is available.
         return distribution
 
     # ------------------------------------------------------------------ SNS
@@ -521,7 +509,12 @@ class CoreStack(Stack):
             "DashboardApi",
             entry="lambdas/dashboard_api",
             handler="dashboard_api.handler.handler",
-            include_shared=False,
+            # include_shared=True mirrors the lambdas/ tree in the bundle
+            # (dashboard_api/handler.py + shared/), so the full-dotted handler path
+            # and `from dashboard_api.routes import ...` resolve at runtime. With
+            # include_shared=False the bundle flattens to the zip root and the
+            # import fails at cold start. Matches every other Lambda here.
+            include_shared=True,
             memory_size=512,
             timeout=Duration.seconds(30),
             environment={
@@ -549,6 +542,28 @@ class CoreStack(Stack):
         ):
             # These inherit the default bearer authorizer (no per-route override).
             http_api.add_routes(path=path, methods=[HttpMethod.GET], integration=integration)
+
+        # --- SPA assets + runtime /config.json, in one deployment. ---
+        # The SPA fetches /config.json at startup to discover the API URL, so the
+        # built artifact stays environment-agnostic (no build-time URL injection).
+        # http_api.api_endpoint is a CDK Token; Source.data() is Token-aware and
+        # substitutes it at deploy time via a custom resource. The asset is gated on
+        # dashboard/dist existing so `make synth`/CI (which don't build the SPA)
+        # keep the placeholder page.
+        config_json = json.dumps({"apiBaseUrl": http_api.api_endpoint})
+        spa_sources = [s3deploy.Source.data("config.json", config_json)]
+        if DASHBOARD_DIST_DIR.is_dir():
+            spa_sources.insert(0, s3deploy.Source.asset(str(DASHBOARD_DIST_DIR)))
+        else:
+            spa_sources.insert(0, s3deploy.Source.data("index.html", PLACEHOLDER_HTML))
+        s3deploy.BucketDeployment(
+            self,
+            "DashboardDeployment",
+            sources=spa_sources,
+            destination_bucket=buckets["dashboard"],
+            distribution=distribution,
+            distribution_paths=["/*"],
+        )
 
         return http_api.api_endpoint
 

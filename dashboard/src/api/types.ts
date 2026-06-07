@@ -1,3 +1,7 @@
+export interface DashboardConfig {
+  apiBaseUrl: string;
+}
+
 export type Severity = "info" | "low" | "medium" | "high";
 export type FindingStatus = "open" | "in_remediation" | "resolved" | "skipped";
 export type PolicyDecision = "auto" | "prompt" | "dry_run" | "skip" | null;
