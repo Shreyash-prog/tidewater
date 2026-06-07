@@ -2,6 +2,14 @@ export interface DashboardConfig {
   apiBaseUrl: string;
 }
 
+export interface ApprovalDecision {
+  approval_id: string;
+  status: "approved" | "rejected";
+  decided_by: string;
+  decided_at: string;
+  reason?: string | null;
+}
+
 export type Severity = "info" | "low" | "medium" | "high";
 export type FindingStatus = "open" | "in_remediation" | "resolved" | "skipped";
 export type PolicyDecision = "auto" | "prompt" | "dry_run" | "skip" | null;
