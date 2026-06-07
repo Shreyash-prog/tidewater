@@ -1,6 +1,7 @@
 import type { DashboardConfig } from "@/api/types";
 
 const TOKEN_KEY = "tidewater_token";
+const APPROVER_KEY = "tidewater_approver";
 
 let configPromise: Promise<DashboardConfig> | null = null;
 
@@ -48,12 +49,47 @@ export function clearToken(): void {
   localStorage.removeItem(TOKEN_KEY);
 }
 
+export function getApprover(): string | null {
+  return localStorage.getItem(APPROVER_KEY);
+}
+
+export function setApprover(name: string): void {
+  localStorage.setItem(APPROVER_KEY, name.trim());
+}
+
+export function clearApprover(): void {
+  localStorage.removeItem(APPROVER_KEY);
+}
+
 export async function apiGet<T>(path: string): Promise<T> {
   const { apiBaseUrl } = await loadConfig();
   const token = getToken();
   if (!token) throw new ApiError(401, "no token");
   const resp = await fetch(`${apiBaseUrl}${path}`, {
     headers: { Authorization: `Bearer ${token}` },
+  });
+  if (resp.status === 401 || resp.status === 403) {
+    clearToken();
+    window.location.reload();
+    throw new ApiError(resp.status, "invalid token");
+  }
+  if (!resp.ok) {
+    throw new ApiError(resp.status, await resp.text());
+  }
+  return (await resp.json()) as T;
+}
+
+export async function apiPost<T>(path: string, body: object): Promise<T> {
+  const { apiBaseUrl } = await loadConfig();
+  const token = getToken();
+  if (!token) throw new ApiError(401, "no token");
+  const resp = await fetch(`${apiBaseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
   });
   if (resp.status === 401 || resp.status === 403) {
     clearToken();

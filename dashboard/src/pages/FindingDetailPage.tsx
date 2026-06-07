@@ -1,8 +1,10 @@
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { apiGet } from "@/api/client";
 import type { AuditResponse, Finding, SnapshotResponse } from "@/api/types";
 import { useAsync } from "@/hooks/useAsync";
+import { ApprovalActions } from "@/components/ApprovalActions";
 import { DecisionBadge, SeverityBadge, StatusBadge } from "@/components/badges";
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -34,14 +36,16 @@ async function downloadSnapshot(pk: string, sk: string) {
 
 export function FindingDetailPage() {
   const { pk = "", sk = "" } = useParams();
+  // Bumped after an approval decision to refetch the finding + audit.
+  const [version, setVersion] = useState(0);
   const finding = useAsync<Finding>(
     () => apiGet<Finding>(`/findings/${encodeURIComponent(pk)}/${encodeURIComponent(sk)}`),
-    [pk, sk],
+    [pk, sk, version],
   );
   const audit = useAsync<AuditResponse>(
     () =>
       apiGet<AuditResponse>(`/findings/${encodeURIComponent(pk)}/${encodeURIComponent(sk)}/audit`),
-    [pk, sk],
+    [pk, sk, version],
   );
 
   if (finding.loading) return <p className="p-6 text-sm text-muted-foreground">Loading…</p>;
@@ -60,6 +64,8 @@ export function FindingDetailPage() {
         <h1 className="text-xl font-semibold">{f.rule_id}</h1>
       </div>
       <p className="break-all font-mono text-sm text-muted-foreground">{f.resource_arn}</p>
+
+      <ApprovalActions finding={f} onDecided={() => setVersion((v) => v + 1)} />
 
       <Section title="Metadata">
         <div className="grid grid-cols-2 gap-3 md:grid-cols-3">

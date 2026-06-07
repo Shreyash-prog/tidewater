@@ -417,6 +417,37 @@ def test_authorizer_can_read_bearer_token(resources: dict[str, dict]) -> None:
     assert "ssm:GetParameter" in actions, f"authorizer lacks ssm:GetParameter: {sorted(actions)}"
 
 
+# ------------------------------------------------------------ Phase 9b approval route
+def test_post_approvals_route_exists(resources: dict[str, dict]) -> None:
+    routes = {
+        v["Properties"]["RouteKey"]
+        for v in _of_type(resources, "AWS::ApiGatewayV2::Route").values()
+    }
+    assert "POST /approvals/{approval_id}" in routes, sorted(routes)
+    # It inherits the bearer authorizer, like the read routes.
+    for v in _of_type(resources, "AWS::ApiGatewayV2::Route").values():
+        if v["Properties"]["RouteKey"] == "POST /approvals/{approval_id}":
+            assert v["Properties"].get("AuthorizationType") == "CUSTOM"
+
+
+def test_dashboard_api_can_mutate_approval_and_finding(resources: dict[str, dict]) -> None:
+    name, _ = _single_function(resources, "DashboardApiFunction")
+    role_id = _role_id_for_function(resources, name)
+    findings_actions = _actions_on_table(resources, role_id, "FindingsTable")
+    approvals_actions = _actions_on_table(resources, role_id, "ApprovalsTable")
+    assert "dynamodb:UpdateItem" in findings_actions, sorted(findings_actions)
+    assert "dynamodb:UpdateItem" in approvals_actions, sorted(approvals_actions)
+    assert "dynamodb:GetItem" in approvals_actions, sorted(approvals_actions)
+
+
+def test_dashboard_api_can_invoke_remediator_and_emit_events(resources: dict[str, dict]) -> None:
+    name, _ = _single_function(resources, "DashboardApiFunction")
+    role_id = _role_id_for_function(resources, name)
+    actions = _actions_granted_to_role(resources, role_id)
+    assert "lambda:InvokeFunction" in actions, f"dashboard lacks InvokeFunction: {sorted(actions)}"
+    assert "events:PutEvents" in actions, f"dashboard lacks PutEvents: {sorted(actions)}"
+
+
 # ----------------------------------------------- PythonLambda handler/bundle guard
 def _expected_handler_source(lam: PythonLambda) -> Path:
     """The source file the Lambda's handler must resolve to, given its bundle layout.

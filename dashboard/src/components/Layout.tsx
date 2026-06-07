@@ -1,7 +1,9 @@
+import { useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 
 import { cn } from "@/lib/utils";
-import { clearToken } from "@/api/client";
+import { clearToken, getApprover } from "@/api/client";
+import { ApproverPrompt } from "@/components/ApproverPrompt";
 
 const NAV = [
   { to: "/", label: "Findings", end: true },
@@ -9,6 +11,8 @@ const NAV = [
 ];
 
 export function Layout() {
+  const [editingName, setEditingName] = useState(false);
+  const [approver, setApproverState] = useState(getApprover());
   return (
     <div className="flex min-h-screen bg-background text-foreground">
       <aside className="flex w-52 flex-col border-r bg-card">
@@ -35,6 +39,20 @@ export function Layout() {
             </NavLink>
           ))}
         </nav>
+        <div className="border-t px-3 py-2 text-xs text-muted-foreground">
+          {approver ? (
+            <>
+              Approving as <span className="font-medium text-foreground">{approver}</span> ·{" "}
+              <button onClick={() => setEditingName(true)} className="hover:underline">
+                change
+              </button>
+            </>
+          ) : (
+            <button onClick={() => setEditingName(true)} className="hover:underline">
+              Set approver name
+            </button>
+          )}
+        </div>
         <button
           onClick={() => {
             clearToken();
@@ -48,6 +66,18 @@ export function Layout() {
       <main className="flex-1 overflow-auto">
         <Outlet />
       </main>
+      {editingName && (
+        <ApproverPrompt
+          onSaved={(name) => {
+            setApproverState(name);
+            setEditingName(false);
+          }}
+          onCancel={() => {
+            setApproverState(getApprover());
+            setEditingName(false);
+          }}
+        />
+      )}
     </div>
   );
 }

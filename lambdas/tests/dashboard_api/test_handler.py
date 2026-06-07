@@ -68,3 +68,25 @@ def test_handler_error_returns_500(monkeypatch: pytest.MonkeyPatch) -> None:
     resp = h.handler(_event("GET /rules"), _context())
     assert resp["statusCode"] == 500
     assert json.loads(resp["body"])["error"] == "internal server error"
+
+
+def test_post_approvals_route_is_registered() -> None:
+    assert "POST /approvals/{approval_id}" in h.ROUTES
+
+
+def test_tuple_return_passes_status_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A handler returning (body, status) must surface that status, not a flat 200.
+    monkeypatch.setitem(h.ROUTES, "GET /rules", lambda _e: ({"error": "nope"}, 409))
+    resp = h.handler(_event("GET /rules"), _context())
+    assert resp["statusCode"] == 409
+    assert json.loads(resp["body"])["error"] == "nope"
+
+
+def test_options_preflight_works_for_post_route() -> None:
+    resp = h.handler(_event("OPTIONS /approvals/{approval_id}", method="OPTIONS"), _context())
+    assert resp["statusCode"] == 204
+
+
+def test_cors_allows_post() -> None:
+    resp = h.handler(_event("GET /rules"), _context())
+    assert "POST" in resp["headers"]["Access-Control-Allow-Methods"]
