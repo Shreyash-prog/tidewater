@@ -5,13 +5,17 @@ them: log retention, on-demand DynamoDB, bucket removal policies, no NAT
 gateways, and a SecureString bearer-token parameter.
 """
 
+from pathlib import Path
+
 import aws_cdk as cdk
 import pytest
 from aws_cdk import assertions
 
+from infra.constructs.lambda_function import PythonLambda
 from infra.stacks.core_stack import RETAIN_BUCKETS, CoreStack
 
 ENV = cdk.Environment(account="123456789012", region="us-east-1")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Logical-id substrings that identify each bucket's intended removal policy.
 _RETAIN_BUCKET_IDS = ("AuditLogBucket", "SnapshotsBucket")
@@ -411,3 +415,47 @@ def test_authorizer_can_read_bearer_token(resources: dict[str, dict]) -> None:
     role_id = _role_id_for_function(resources, name)
     actions = _actions_granted_to_role(resources, role_id)
     assert "ssm:GetParameter" in actions, f"authorizer lacks ssm:GetParameter: {sorted(actions)}"
+
+
+# ----------------------------------------------- PythonLambda handler/bundle guard
+def _expected_handler_source(lam: PythonLambda) -> Path:
+    """The source file the Lambda's handler must resolve to, given its bundle layout.
+
+    The PythonLambda bundler produces two layouts (see infra/constructs):
+      * include_shared=True  -> mirrors lambdas/ (entry at its lambdas-relative path
+        + a top-level shared/), so a dotted handler like `dashboard_api.handler.handler`
+        resolves to lambdas/dashboard_api/handler.py.
+      * include_shared=False -> flattens the entry's CONTENTS to the zip root, so the
+        handler must be `handler.handler` -> <entry>/handler.py.
+
+    Returns the path that must exist; a mismatch (the Phase 9a defect:
+    include_shared=False with a full-dotted handler) points at a nonexistent file.
+    """
+    module_path = "/".join(lam.handler_path.split(".")[:-1]) + ".py"
+    if lam.include_shared:
+        return REPO_ROOT / "lambdas" / module_path
+    return lam.entry_path / module_path
+
+
+def test_every_python_lambda_handler_resolves_in_bundle() -> None:
+    """Every PythonLambda's handler must map to a real module in its bundle layout.
+
+    Catches asset-vs-handler mismatches (Phase 9a's include_shared=False with a
+    `dashboard_api.handler.handler` handler) at synth time instead of via an opaque
+    Runtime.ImportModuleError 500 at cold start. Runs in-process (no cdk.out / node
+    needed) so it executes in the Python-only pytest CI job.
+    """
+    app = cdk.App(context={"bundle_lambdas": False})
+    stack = CoreStack(app, "HandlerCheck", env=ENV, notification_email="test@example.com")
+    lambdas = [c for c in stack.node.find_all() if isinstance(c, PythonLambda)]
+    assert lambdas, "no PythonLambda constructs found in the stack"
+
+    failures = []
+    for lam in lambdas:
+        expected = _expected_handler_source(lam)
+        if not expected.is_file():
+            failures.append(
+                f"{lam.node.id}: handler={lam.handler_path!r} "
+                f"(include_shared={lam.include_shared}) expects {expected} but it is missing"
+            )
+    assert not failures, "handler/bundle mismatches:\n" + "\n".join(failures)

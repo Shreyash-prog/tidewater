@@ -146,6 +146,12 @@ class PythonLambda(Construct):
         if not entry_path.is_dir():
             raise FileNotFoundError(f"Lambda entry directory not found: {entry_path}")
 
+        # Recorded so a synth-time test can verify the handler's module resolves in
+        # the bundle layout this construct produces (see test_synth_constraints).
+        self.entry_path = entry_path
+        self.handler_path = handler
+        self.include_shared = include_shared
+
         code = self._resolve_code(entry_path, include_shared=include_shared)
 
         # Dedicated log group: 1-day retention, destroyed with the stack.
