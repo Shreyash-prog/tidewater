@@ -4,6 +4,67 @@
 
 > 🚧 **Status: pre-alpha POC under active construction.** Nothing here is production-ready. The auth model is intentionally insecure for demo purposes. Do not deploy publicly.
 
+## Live Demo
+
+A live deployment of Tidewater is running in my AWS account. You can browse the dashboard read-only to see findings, rules, and the framework's accumulated state.
+
+**URL:** https://d2o52kqdxzqimw.cloudfront.net
+
+**Bearer token:** `HwdbqPW9T8HFIn1j6e0xr3H_wlmCOyu74PjhSEAEImw`
+
+### How to access
+
+1. Open the URL above in your browser
+2. When prompted, paste the bearer token shown above
+3. The dashboard loads with the Findings view by default
+
+### What you'll see
+
+**Findings view** (default): a table of every detection the framework has made, with columns for severity, service, rule, resource, status, decision, and timestamp. The data is live — these are real findings from real AWS resources in my account.
+
+You'll see a mix of:
+
+- `lambda.unused_function` findings — the framework detecting its own AWS Lambda functions as idle (it correctly observes its own infrastructure; the meta-detection is intentional)
+- `iam.unused_role` findings — IAM roles that haven't been used recently
+- `iam.unused_policy` findings — managed policies attached to nothing
+- `iam.policy_quota.forecast_alert` findings — predictive alerts where a role's attached-policy count is trending toward the IAM hard limit of 10
+
+Findings carry one of three decisions:
+
+- `auto` — the framework will auto-remediate (e.g., `iam.unused_role` for `Environment: nonprod` resources)
+- `prompt` — waiting for human review (most findings)
+- `skip` — explicitly excluded via tags
+
+And one of four statuses: `open`, `in_remediation`, `resolved`, `skipped`.
+
+**Filter sidebar**: filter findings by severity (high / medium / low), service (iam / lambda), status, or rule_id text.
+
+**Click any finding** to see its full detail page — the metadata, the JSON details from the detector, the audit log trail showing every state transition, and (for findings that triggered auto-remediation) a button to download the resource snapshot that was captured before deletion.
+
+**Rules view** (sidebar nav): cards for each of the 8 currently-loaded rules. Click any rule to see its YAML — threshold, forecast config, policy decision logic, and tag-based overrides.
+
+### What's NOT available in the demo
+
+This deployment is at Phase 9a — the read-only dashboard. Phase 9b (approve/reject buttons for `prompt` findings) is the next phase but not yet deployed; the dashboard is currently view-only.
+
+### What was built
+
+Across the framework's phases:
+
+- **7 detectors** across 2 AWS services (IAM and Lambda)
+- **5 destructive remediation runbooks** via SSM Automation, all snapshot-protected (the resource configuration is saved to S3 before deletion)
+- **Multi-rule race serialization** so a resource flagged by two rules doesn't get conflicting decisions
+- **Quota forecasting** with last-7-days linear regression and four abstention guards (insufficient_data / stable / no_clear_trend / numeric)
+- **Email notifications** for high-severity findings, forecast alerts, and remediation failures, with finding-level deduplication
+- **This dashboard** — the operator-visible surface
+
+### Notes
+
+- The bearer token authenticates browser access to the API. It's POC-grade auth; production would use Cognito or org SSO.
+- The token may be rotated periodically. If it stops working, check this README for the latest value.
+- The demo deployment may be taken down at any time.
+- For questions or to discuss the architecture, please reach out via [your contact link — replace with your actual contact info].
+
 ## What this is
 
 Tidewater watches for "soft" operational limits and accumulated cruft that AWS-native tools (Service Quotas, Trusted Advisor, Compute Optimizer) don't cover:
